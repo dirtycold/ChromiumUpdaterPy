@@ -1,0 +1,2 @@
+qtpy
+pyqt5
