@@ -15,7 +15,7 @@ Build a compact desktop application that manually checks for, downloads, and ins
 - All Qt imports go through `qtpy`.
 - Prefer **PyQt5** for installation guidance and standalone release bundles, without enforcing it in application code. The owner prefers its smaller binaries; measure actual artifact sizes rather than promising a saving.
 - Let QtPy handle binding selection for source installations. Do not add application-level binding selection or enforcement. Users can optionally set `QT_API` themselves; PyQt5 remains the intended standalone packaging binding.
-- **Manual checks only.** No LaunchAgent, scheduled checks, daemon, background updater, or automatic installation. Earlier twice-weekly automation proposals are superseded.
+- Checks are manual by default, with an optional startup check (`AutoCheck`, off by default). Enabling it hides Check for Updates. Wire the actual startup check when the worker is implemented. No automatic downloads or installation, LaunchAgent, scheduled checks, daemon, or background updater. Earlier twice-weekly automation proposals are superseded.
 - Platform order: implement and validate macOS first on this machine, then Windows, and eventually Linux usability. Linux should default to download only because the owner uses Flatpak Chromium. Extraction and installation are explicit optional actions where implemented; Linux work is deferred until after Windows.
 - Download upstream binaries directly. Do not compile Chromium, maintain a binary mirror, or build a Homebrew cask.
 - Release packaging runs **only when a version tag such as `v0.1.0` is pushed**. No scheduled, ordinary-commit, or pull-request packaging.
@@ -44,7 +44,7 @@ Settings expands within the main window as one Settings group, increasing its si
 
 On macOS, expose signing/postprocessing as an option enabled by default. Explain that it removes quarantine and conditionally repairs only the outer signature for the known error described below. Disabling it skips those modifications, not ordinary validation; report verification failures clearly without silently enabling repair.
 
-Only check when requested. Do not automatically download, install, launch Chromium, or close browser processes. If Chromium is running, explain that installation must wait; the user closes it and retries manually. Retain a validated download for that retry according to the cache setting.
+Check when requested manually or on startup when the user has enabled AutoCheck. Do not automatically download, install, launch Chromium, or close browser processes. If Chromium is running, explain that installation must wait; the user closes it and retries manually. Retain a validated download for that retry according to the cache setting.
 
 Keep the interface responsive during network, extraction, signature checks, and filesystem work. Cancellation must leave the installed app usable. Disable cancellation during the short replacement/rollback critical section and display the current phase.
 
@@ -75,7 +75,7 @@ Use Google's official `chromium-browser-snapshots` storage over HTTPS with certi
 
 On macOS, use `Mac_Arm` or `Mac`, the corresponding `LAST_CHANGE`, and revision-specific `chrome-mac.zip`. Capture the chosen revision once so a changing latest pointer cannot mix metadata and downloads. Validate revision responses as positive integers. Never silently downgrade.
 
-For Windows, verify current upstream platform names, artifacts, and behavior before implementation. The old project used `Win`/`Win_x64` and `mini_installer.exe`; do not assume these remain the best choices. Prefer an official portable archive if it provides clearer ownership and rollback, after checking current availability.
+Windows artifact inspection confirmed both `chrome-win.zip` and `mini_installer.exe` in current `Win`, `Win_x64`, and `Win_Arm64` snapshots. Offer both through the package preference. Recheck revision-specific availability and validate behavior when implementing Windows operations.
 
 Stream downloads into partial files. Support bounded timeouts/retries, cancellation, HTTP errors, truncated-download detection, cleanup, and indeterminate progress when length is unknown. Promote a file to reusable cache only after validation; filename existence is insufficient.
 
@@ -131,6 +131,24 @@ Keep the app name and `org.chromium.Chromium` bundle ID. Ad-hoc signing can affe
 Planning inspection found Chromium 159.0.8138.0 installed on the owner's Mac with an ad-hoc outer signature and a linker-signed framework. Recursive verification failed on the framework. That finding does **not** justify deviating from the successful outer-only SOP. Do not modify the current installation merely to reproduce it.
 
 ## Windows signing and installation
+
+The settings UI now offers EXE or ZIP, with EXE as the default. For matching
+Windows targets, EXE installation runs the upstream installer with an optional
+all-users preference corresponding to `--system-level` (not `--system`). The
+installer owns the destination; hide manual extraction and install-folder
+editing. ZIP extraction uses the specified destination and has optional desktop
+shortcut creation, off by default; the separate Install checkbox is unnecessary
+for this route and is hidden. Show
+platform-specific controls only when the resolved target matches the native host:
+macOS preparation on matching Macs; package, system-wide installation, and desktop
+shortcut options on matching Windows. Hide their labels too and adjust window
+height while retaining fixed width. Save all preferences as strings, preserving
+hidden and disabled choices. Foreign targets remain download only.
+Order settings Common, Specific, then Proxy. Hide inapplicable controls and their
+labels, including prerequisite-dependent operations and nonmanual proxy fields.
+These are options only: no Windows operations have been implemented. Taskbar
+pinning has no settings option for now; revisit it when developing on a Windows
+machine.
 
 Windows generally does not require a local signature repair equivalent to this macOS procedure. Preserve upstream executable contents and signatures. SmartScreen, Smart App Control, and organizational policy may warn about or block applications; local self-signing is not a general remedy. Do not automatically unblock files, alter security policies, or self-sign Chromium.
 

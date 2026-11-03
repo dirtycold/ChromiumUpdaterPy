@@ -3,11 +3,11 @@
 import sys
 from enum import Enum
 
-from qtpy.QtCore    import  QSettings, QStandardPaths, QSysInfo, Qt
+from qtpy.QtCore    import  QSettings, QStandardPaths, QSysInfo, QTimer, Qt
 from qtpy.QtWidgets import (QApplication, QCheckBox, QComboBox, QFileDialog, 
                             QFormLayout, QGroupBox, QHBoxLayout, QLabel, 
                             QLayout, QLineEdit, QProgressBar, QPushButton, 
-                            QSpinBox, QVBoxLayout, QWidget,
+                            QSizePolicy, QSpinBox, QVBoxLayout, QWidget,
                             )
 
 
@@ -16,9 +16,13 @@ class Platform:
         DOWNLOAD = 0
         INSTALL  = 1
 
+    class Package(Enum):
+        EXE = 0
+        ZIP = 1
+
     def __init__(self):
-        self.system = {"darwin": "macos", "win32": "windows", "linux": "linux"}.get(sys.platform, "")
-        self.architecture = {
+        self.os = {"darwin": "macos", "win32": "windows", "linux": "linux"}.get(sys.platform, "")
+        self.arch = {
             "arm64": "arm64", "aarch64": "arm64",
             "x86_64": "x64", "amd64": "x64",
             "i386": "x86", "i686": "x86", "x86": "x86",
@@ -27,39 +31,35 @@ class Platform:
     @staticmethod
     def supported():
         return {
-            "macos-arm64": "macOS · ARM64",
-            "macos-x64": "macOS · x64",
-            "windows-arm64": "Windows · ARM64",
-            "windows-x64": "Windows · x64",
-            "windows-x86": "Windows · x86",
-            "linux-arm64": "Linux · ARM64",
-            "linux-x64": "Linux · x64",
+            "macos-arm64":      "macOS · ARM64",
+            "macos-x64":        "macOS · x64",
+            "windows-arm64":    "Windows · ARM64",
+            "windows-x64":      "Windows · x64",
+            "windows-x86":      "Windows · x86",
+            "linux-arm64":      "Linux · ARM64",
+            "linux-x64":        "Linux · x64",
         }
 
+    def system(self):
+        return self.os
+
     def current(self):
-        target = f"{self.system}-{self.architecture}"
+        target = f"{self.os}-{self.arch}"
         return target if target in Platform.supported() else ""
 
-    def extract(self):
-        return self.system in {"macos", "windows"}
-
-    def compare(self, target):
+    def native(self, target):
         return bool(target) and target == self.current()
-
-    def verify(self, target):
-        return self.compare(target) and self.system == "macos"
 
     def directory(self, kind: Directory):
         if kind == self.Directory.DOWNLOAD:
             return QStandardPaths.writableLocation(QStandardPaths.CacheLocation)
         if kind != self.Directory.INSTALL:
             return ""
-        home = QStandardPaths.writableLocation(QStandardPaths.HomeLocation)
         return {
-            "macos": f"{home}/Applications",
-            "windows": QStandardPaths.writableLocation(QStandardPaths.AppLocalDataLocation) + "/Chromium",
-            "linux": f"{home}/.local/opt/chromium",
-        }.get(self.system, "")
+            "macos":    QStandardPaths.writableLocation(QStandardPaths.ApplicationsLocation),
+            "windows":  QStandardPaths.writableLocation(QStandardPaths.AppLocalDataLocation) + "/Chromium",
+            "linux":    QStandardPaths.writableLocation(QStandardPaths.HomeLocation) + "/.local/opt/chromium",
+        }.get(self.os, "")
 
 
 class Proxy:
@@ -72,12 +72,16 @@ class Proxy:
 class Settings:
     class Option(Enum):
         PLATFORM    = "Platform"
+        AUTOCHECK   = "AutoCheck"
         EXTRACT     = "Extract"
         INSTALL     = "Install"
         CLEANUP     = "Cleanup"
         DOWNLOADDIR = "Directory/Download"
         INSTALLDIR  = "Directory/Install"
         MACSIGNER   = "Mac/Sign"
+        WINPACKAGE  = "Win/Package"
+        WINSYSTEM   = "Win/System"
+        DESKTOP     = "Win/Desktop"
         PROXYMODE   = "Proxy/Mode"
         PROXYHOST   = "Proxy/Host"
         PROXYPORT   = "Proxy/Port"
@@ -86,12 +90,16 @@ class Settings:
         self.setting = QSettings()
         defaults = {
             self.Option.PLATFORM:       platform.current(),
-            self.Option.EXTRACT:        "true" if platform.extract() else "false",
-            self.Option.INSTALL:        "true" if platform.extract() else "false",
+            self.Option.AUTOCHECK:      "false",
+            self.Option.EXTRACT:        "true" if platform.system() in {"macos", "windows"} else "false",
+            self.Option.INSTALL:        "true" if platform.system() in {"macos", "windows"} else "false",
             self.Option.CLEANUP:        "false",
             self.Option.DOWNLOADDIR:    platform.directory(Platform.Directory.DOWNLOAD),
             self.Option.INSTALLDIR:     platform.directory(Platform.Directory.INSTALL),
             self.Option.MACSIGNER:      "true",
+            self.Option.WINPACKAGE:     Platform.Package.EXE.name,
+            self.Option.WINSYSTEM:      "false",
+            self.Option.DESKTOP:        "false",
             self.Option.PROXYMODE:      Proxy.Mode.SYSTEM.name,
             self.Option.PROXYHOST:      "",
             self.Option.PROXYPORT:      "8080",
@@ -121,6 +129,7 @@ class Window(QWidget):
         self.targetBadge.setToolTip("Selected download target")
         self.targetBadge.setStyleSheet(
             "border: 1px solid palette(mid); border-radius: 3px; padding: 2px 6px;")
+        self.targetBadge.setFixedHeight(self.targetBadge.sizeHint().height())
 
         status = QHBoxLayout()
         status.addWidget(self.status, 1)
@@ -146,33 +155,69 @@ class Window(QWidget):
 
         settingsPanel = QGroupBox("Settings")
         self.settingsLayout = QFormLayout(settingsPanel)
+        self.settingsLayout.setFormAlignment(Qt.AlignLeft | Qt.AlignTop)
+        self.settingsLayout.setLabelAlignment(Qt.AlignLeft)
+        self.settingsLayout.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
         self.settingsLayout.addRow("Platform", self.platformCombo)
 
         self.settingsLayout.addRow("Download folder", self.directory(Settings.Option.DOWNLOADDIR))
 
+        self.packageCombo = QComboBox()
+        self.packageCombo.addItem("EXE installer", Platform.Package.EXE)
+        self.packageCombo.addItem("ZIP archive", Platform.Package.ZIP)
+        try:
+            package = Platform.Package[self.settings.get(Settings.Option.WINPACKAGE).upper()]
+        except KeyError:
+            package = Platform.Package.EXE
+        self.packageCombo.setCurrentIndex(package.value)
+        self.packageCombo.currentIndexChanged.connect(lambda: (
+            self.settings.set(Settings.Option.WINPACKAGE, self.packageCombo.currentData().name),
+            self.apply(),
+        ))
+
+        autoCheck = QCheckBox("Check for updates on startup")
+        autoCheck.setToolTip("Check the selected target when the updater opens; no automatic download or installation")
         self.extractCheck = QCheckBox("Extract downloaded archive")
         self.installCheck = QCheckBox("Install extracted Chromium")
         self.prepareCheck = QCheckBox("Prepare Chromium for macOS")
         self.prepareCheck.setToolTip(
             "Remove quarantine; repair only the outer app signature for the known resource error.")
-        self.cleanupCheck = QCheckBox("Remove archive after successful installation")
+        self.cleanupCheck = QCheckBox("Remove download after setup")
+        self.cleanupCheck.setToolTip("Only after the requested extraction or installation succeeds")
+        self.systemCheck = QCheckBox("Install system-wide for Windows")
+        self.systemCheck.setToolTip("Windows EXE installer: --system-level; requires administrator approval")
+        self.desktopCheck = QCheckBox("Create desktop shortcut for Windows")
+        self.desktopCheck.setToolTip("Windows ZIP extraction only")
         for checkbox, option in (
+                (autoCheck, Settings.Option.AUTOCHECK),
                 (self.extractCheck, Settings.Option.EXTRACT),
                 (self.installCheck, Settings.Option.INSTALL),
                 (self.prepareCheck, Settings.Option.MACSIGNER),
-                (self.cleanupCheck, Settings.Option.CLEANUP)):
+                (self.cleanupCheck, Settings.Option.CLEANUP),
+                (self.systemCheck, Settings.Option.WINSYSTEM),
+                (self.desktopCheck, Settings.Option.DESKTOP)):
             checkbox.setChecked(self.settings.get(option) == "true")
             checkbox.toggled.connect(lambda checked, key=option: (
                 self.settings.set(key, "true" if checked else "false"),
                 self.apply(),
             ))
 
-        self.settingsLayout.addRow(self.extractCheck)
-        self.settingsLayout.addRow(self.installCheck)
+        refreshButton = QPushButton("Manual refresh")
+        refreshButton.setToolTip("Check for updates now")
+        refreshButton.clicked.connect(checkButton.click)
+        autoCheck.toggled.connect(refreshButton.setVisible)
+        self.settingsLayout.addRow(self.row(autoCheck, refreshButton))
+        refreshButton.setVisible(autoCheck.isChecked())
+        self.settingsLayout.addRow(self.row(self.extractCheck))
+        self.settingsLayout.addRow(self.row(self.installCheck))
         self.installDirectory = self.directory(Settings.Option.INSTALLDIR)
         self.settingsLayout.addRow("Install folder", self.installDirectory)
-        self.settingsLayout.addRow(self.prepareCheck)
-        self.settingsLayout.addRow(self.cleanupCheck)
+        self.settingsLayout.addRow(self.row(self.cleanupCheck))
+
+        self.settingsLayout.addRow(self.row(self.prepareCheck))
+        self.settingsLayout.addRow("Windows package", self.packageCombo)
+        self.settingsLayout.addRow(self.row(self.systemCheck))
+        self.settingsLayout.addRow(self.row(self.desktopCheck))
 
         self.proxyMode = QComboBox()
         for mode in Proxy.Mode:
@@ -188,6 +233,7 @@ class Window(QWidget):
         ))
         self.settingsLayout.addRow("Proxy", self.proxyMode)
         self.proxyHost = QLineEdit(self.settings.get(Settings.Option.PROXYHOST))
+        self.proxyHost.setMinimumWidth(240)
         self.proxyHost.setPlaceholderText("proxy.example.com")
         self.proxyHost.setToolTip("Hostname only; authenticated proxies are not supported yet")
         self.proxyHost.editingFinished.connect(
@@ -195,6 +241,7 @@ class Window(QWidget):
         self.settingsLayout.addRow("Proxy host", self.proxyHost)
         self.proxyPort = QSpinBox()
         self.proxyPort.setRange(1, 65535)
+        self.proxyPort.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         try:
             port = int(self.settings.get(Settings.Option.PROXYPORT))
         except ValueError:
@@ -204,11 +251,13 @@ class Window(QWidget):
             lambda value: self.settings.set(Settings.Option.PROXYPORT, str(value)))
         self.settingsLayout.addRow("Proxy port", self.proxyPort)
 
-        self.apply()
+        for combo in (self.platformCombo, self.packageCombo, self.proxyMode):
+            combo.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+
         settingsPanel.hide()
         settingsButton.toggled.connect(lambda visible: (
             settingsPanel.setVisible(visible),
-            self.setFixedHeight(self.sizeHint().height()),
+            QTimer.singleShot(0, lambda: self.setFixedHeight(self.sizeHint().height())),
         ))
 
         self.progress = QProgressBar()
@@ -229,11 +278,25 @@ class Window(QWidget):
         layout.addLayout(progress)
         layout.addLayout(actions)
         layout.addWidget(settingsPanel)
-        self.setFixedHeight(self.sizeHint().height())
+        autoCheck.toggled.connect(lambda enabled: checkButton.setVisible(not enabled))
+        checkButton.setVisible(not autoCheck.isChecked())
+        self.apply()
+
+    @staticmethod
+    def row(checkbox, button=None):
+        widget = QWidget()
+        layout = QHBoxLayout(widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(checkbox)
+        layout.addStretch()
+        if button is not None:
+            layout.addWidget(button)
+        return widget
 
     def directory(self, option):
         widget = QWidget()
         edit = QLineEdit(self.settings.get(option))
+        edit.setMinimumWidth(240)
         edit.textChanged.connect(lambda value: self.settings.set(option, value))
         browse = QPushButton("Browse…")
         browse.clicked.connect(lambda: edit.setText(directory) if (
@@ -248,22 +311,34 @@ class Window(QWidget):
     def apply(self):
         target = self.platformCombo.currentData() or self.platform.current()
         self.targetBadge.setText(Platform.supported().get(target, "Unknown target"))
-        local = self.platform.compare(target)
-        extract = local and self.extractCheck.isChecked()
-        install = extract and self.installCheck.isChecked()
-        self.extractCheck.setEnabled(local)
-        self.installCheck.setEnabled(extract)
-        self.installDirectory.setEnabled(install)
-        self.settingsLayout.labelForField(self.installDirectory).setEnabled(install)
-        self.prepareCheck.setEnabled(extract and self.platform.verify(target))
-        self.cleanupCheck.setEnabled(install)
-        self.extractCheck.setToolTip(
-            "Extract on this computer" if local else "Other targets are download only")
-
+        native = self.platform.native(target)
+        system = self.platform.system()
+        windows = native and system == "windows"
+        macos = native and system == "macos"
+        exe = windows and self.packageCombo.currentData() == Platform.Package.EXE
+        portable = windows and not exe
+        extract = native and not exe and self.extractCheck.isChecked()
+        install = native and not portable and (exe or extract) and self.installCheck.isChecked()
+        destination = (install and not exe) or (portable and extract)
         manual = self.proxyMode.currentData() == Proxy.Mode.MANUAL
-        for widget in (self.proxyHost, self.proxyPort):
-            widget.setEnabled(manual)
-            self.settingsLayout.labelForField(widget).setEnabled(manual)
+        for widget, applicable in (
+                (self.extractCheck.parentWidget(), native and not exe),
+                (self.installCheck.parentWidget(), native and not portable and (exe or extract)),
+                (self.installDirectory, destination),
+                (self.cleanupCheck.parentWidget(), install or (portable and extract)),
+                (self.prepareCheck.parentWidget(), extract and macos),
+                (self.packageCombo, windows),
+                (self.systemCheck.parentWidget(), install and exe),
+                (self.desktopCheck.parentWidget(), portable and extract),
+                (self.proxyHost, manual),
+                (self.proxyPort, manual)):
+            widget.setVisible(applicable)
+            widget.setEnabled(applicable)
+            label = self.settingsLayout.labelForField(widget)
+            if label is not None:
+                label.setVisible(applicable)
+                label.setEnabled(applicable)
+        self.installCheck.setText("Run Chromium installer" if exe else "Install extracted Chromium")
 
         if install:
             action = "Download and Install"
@@ -272,6 +347,7 @@ class Window(QWidget):
         else:
             action = "Download"
         self.actionButton.setText(action)
+        QTimer.singleShot(0, lambda: self.setFixedHeight(self.sizeHint().height()))
 
 
 if __name__ == "__main__":

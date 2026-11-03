@@ -22,6 +22,13 @@ preferences (system, direct, or a manual HTTP host/port). Operation buttons rema
 placeholders until their behavior is implemented. There is no
 downloader, worker, extraction, installation, or signing implementation at this step.
 
+Check for updates on startup is an opt-in preference, off by default. Enabling it
+hides the main Check for Updates button and shows Manual refresh beside the option
+in Settings. When auto-check is off, Manual refresh is hidden. Both manual buttons
+share the same check action; the startup check itself will be connected
+when the checking worker is implemented. It will not download or install anything
+automatically or schedule background checks.
+
 Status is an ordinary label, independent of the native progress bar's rendering.
 The download target defaults to the detected OS/native CPU architecture when no
 saved choice exists. Changing it saves the choice and updates the badge. Platform
@@ -31,13 +38,32 @@ Selecting Auto saves an empty preference and resolves it to the detected concret
 platform for the badge and operation settings.
 
 When the target differs from the detected platform/architecture, extraction,
-installation, macOS preparation, and post-install cleanup are disabled. The action
+installation, macOS preparation, and post-install cleanup are hidden and disabled. The action
 becomes Download. Saved preferences remain intact for switching back. Download
-folder and proxy controls still apply. Installation requires extraction; macOS
-preparation requires a matching macOS target and extraction. Archive cleanup runs
-only after a successful installation, when those operations are implemented.
+folder and proxy controls still apply. Archive-based installation requires extraction; macOS
+preparation requires a matching macOS target and extraction. Download cleanup will
+run only after successful installation or Windows ZIP extraction, when those
+operations are implemented. Settings are ordered Common, Specific, then Proxy;
+inapplicable controls and their labels are hidden, including manual-proxy fields
+outside Manual mode.
 Linux defaults to download only. macOS preparation defaults to enabled and archive
 cleanup defaults to disabled. The manual proxy UI has no password fields.
+The Linux install default (`~/.local/opt/chromium`) and Windows ZIP destination
+(`AppLocalDataLocation/Chromium`) are provisional custom choices pending platform
+testing. Existing saved destinations take precedence over these defaults.
+
+Platform-specific controls are visible only when the resolved target matches the
+host: macOS preparation on a matching Mac; Windows package, all-users installation,
+and desktop shortcut options on matching Windows. Auto resolves to the native
+target. Hidden preferences remain saved and the window height follows visible rows.
+Windows preferences offer EXE (default) or ZIP. With EXE selected, Install means running the installer. Its optional
+all-users mode corresponds to `--system-level` and will require administrator
+approval; extraction and custom destination are hidden. With ZIP selected,
+Extract uses the chosen Install folder, and the redundant Install checkbox is
+hidden. Optional desktop shortcut creation is available for ZIP extraction,
+off by default. Cleanup applies after successful requested setup. Taskbar pinning
+is deferred until development on a Windows machine. Only preferences and UI
+behavior exist; no installer, extraction, or shortcut operation is implemented yet.
 
 Settings uses `QSettings()` with the platform's native backend and the application's
 organization/name. No INI filename or format is specified. Keys use
