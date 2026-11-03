@@ -2,13 +2,20 @@
 
 import sys
 from enum import Enum
+from pathlib import Path
 
 from qtpy.QtCore    import  QSettings, QStandardPaths, QSysInfo, QTimer, Qt
+from qtpy.QtGui     import  QIcon
 from qtpy.QtWidgets import (QApplication, QCheckBox, QComboBox, QFileDialog, 
                             QFormLayout, QGroupBox, QHBoxLayout, QLabel, 
                             QLayout, QLineEdit, QProgressBar, QPushButton, 
                             QSizePolicy, QSpinBox, QVBoxLayout, QWidget,
                             )
+
+
+def resource(name):
+    """Bundled file path: PyInstaller's unpack folder when frozen, else next to this script."""
+    return str(Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)) / name)
 
 
 class Platform:
@@ -351,9 +358,16 @@ class Window(QWidget):
 
 
 if __name__ == "__main__":
+    if sys.platform == "win32":
+        # The taskbar button takes its icon from the process's application
+        # id, not the window; run through python.exe it would be Python's.
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ChromiumUpdater.ChromiumUpdaterPy")
+
     app = QApplication(sys.argv)
     app.setApplicationName("ChromiumUpdaterPy")
-    app.setOrganizationName("ChromiumUpdaterPy")
+    app.setOrganizationName("ChromiumUpdater")
+    app.setWindowIcon(QIcon(resource("icon.svg")))
     window = Window()
     window.show()
     sys.exit(app.exec())
