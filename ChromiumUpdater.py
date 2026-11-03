@@ -4,7 +4,7 @@ import sys
 from enum import Enum
 from pathlib import Path
 
-from qtpy.QtCore    import  QSettings, QStandardPaths, QSysInfo, QTimer, Qt
+from qtpy.QtCore    import  QEvent, QSettings, QStandardPaths, QSysInfo, Qt
 from qtpy.QtGui     import  QIcon
 from qtpy.QtWidgets import (QApplication, QCheckBox, QComboBox, QFileDialog, 
                             QFormLayout, QGroupBox, QHBoxLayout, QLabel, 
@@ -95,31 +95,32 @@ class Settings:
 
     def __init__(self, platform: Platform):
         self.setting = QSettings()
-        defaults = {
+        self.defaults = {
             self.Option.PLATFORM:       platform.current(),
-            self.Option.AUTOCHECK:      "false",
-            self.Option.EXTRACT:        "true" if platform.system() in {"macos", "windows"} else "false",
-            self.Option.INSTALL:        "true" if platform.system() in {"macos", "windows"} else "false",
-            self.Option.CLEANUP:        "false",
+            self.Option.AUTOCHECK:      False,
+            self.Option.EXTRACT:        platform.system() in {"macos", "windows"},
+            self.Option.INSTALL:        platform.system() in {"macos", "windows"},
+            self.Option.CLEANUP:        False,
             self.Option.DOWNLOADDIR:    platform.directory(Platform.Directory.DOWNLOAD),
             self.Option.INSTALLDIR:     platform.directory(Platform.Directory.INSTALL),
-            self.Option.MACSIGNER:      "true",
+            self.Option.MACSIGNER:      True,
             self.Option.WINPACKAGE:     Platform.Package.EXE.name,
-            self.Option.WINSYSTEM:      "false",
-            self.Option.DESKTOP:        "false",
+            self.Option.WINSYSTEM:      False,
+            self.Option.DESKTOP:        False,
             self.Option.PROXYMODE:      Proxy.Mode.SYSTEM.name,
             self.Option.PROXYHOST:      "",
-            self.Option.PROXYPORT:      "8080",
+            self.Option.PROXYPORT:      8080,
         }
-        for option, value in defaults.items():
-            if not self.setting.contains(option.value):
-                self.set(option, value)
 
-    def get(self, option: Option) -> str:
-        return self.setting.value(option.value, "", type=str)
+    def get(self, option: Option):
+        default = self.defaults[option]
+        try:
+            return self.setting.value(option.value, default, type(default))
+        except TypeError:
+            return default
 
-    def set(self, option: Option, value: str):
-        self.setting.setValue(option.value, str(value))
+    def set(self, option: Option, value):
+        self.setting.setValue(option.value, type(self.defaults[option])(value))
 
 
 class Window(QWidget):
@@ -129,7 +130,6 @@ class Window(QWidget):
         self.setFixedWidth(520)
         self.platform = Platform()
         self.settings = Settings(self.platform)
-        target = self.settings.get(Settings.Option.PLATFORM)
 
         self.status = QLabel("Ready")
         self.targetBadge = QLabel()
@@ -148,39 +148,40 @@ class Window(QWidget):
         settingsButton = QPushButton("Settings")
         settingsButton.setCheckable(True)
 
-        self.platformCombo = QComboBox()
-        self.platformCombo.addItem("Auto", "")
-        for value, label in Platform.supported().items():
-            self.platformCombo.addItem(label, value)
+        self.progress = QProgressBar()
+
+        progress = QHBoxLayout()
+        progress.addWidget(self.progress)
+        progress.addWidget(urlButton)
+
+        actions = QHBoxLayout()
+        actions.addWidget(checkButton)
+        actions.addWidget(self.actionButton)
+        actions.addStretch()
+        actions.addWidget(settingsButton)
+
+        layout = QVBoxLayout(self)
+        layout.setSizeConstraint(QLayout.SetNoConstraint)
+        layout.addLayout(status)
+        layout.addLayout(progress)
+        layout.addLayout(actions)
+        settingsPanel = self.panel(checkButton)
+        settingsPanel.hide()
+        layout.addWidget(settingsPanel)
+        settingsButton.toggled.connect(settingsPanel.setVisible)
+        self.apply()
+
+    def panel(self, checkButton):
+        target = self.settings.get(Settings.Option.PLATFORM)
+        platforms = [("Auto", "")] + [(label, value) for value, label in Platform.supported().items()]
         if target and target not in Platform.supported():
-            self.platformCombo.addItem(f"Unknown target: {target}", target)
-        self.platformCombo.setCurrentIndex(self.platformCombo.findData(target))
-        self.platformCombo.currentIndexChanged.connect(lambda: (
-            self.settings.set(Settings.Option.PLATFORM, self.platformCombo.currentData()),
-            self.apply(),
-        ))
+            platforms.append((f"Unknown target: {target}", target))
+        self.platformCombo = self.choice(Settings.Option.PLATFORM, platforms)
 
-        settingsPanel = QGroupBox("Settings")
-        self.settingsLayout = QFormLayout(settingsPanel)
-        self.settingsLayout.setFormAlignment(Qt.AlignLeft | Qt.AlignTop)
-        self.settingsLayout.setLabelAlignment(Qt.AlignLeft)
-        self.settingsLayout.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
-        self.settingsLayout.addRow("Platform", self.platformCombo)
-
-        self.settingsLayout.addRow("Download folder", self.directory(Settings.Option.DOWNLOADDIR))
-
-        self.packageCombo = QComboBox()
-        self.packageCombo.addItem("EXE installer", Platform.Package.EXE)
-        self.packageCombo.addItem("ZIP archive", Platform.Package.ZIP)
-        try:
-            package = Platform.Package[self.settings.get(Settings.Option.WINPACKAGE).upper()]
-        except KeyError:
-            package = Platform.Package.EXE
-        self.packageCombo.setCurrentIndex(package.value)
-        self.packageCombo.currentIndexChanged.connect(lambda: (
-            self.settings.set(Settings.Option.WINPACKAGE, self.packageCombo.currentData().name),
-            self.apply(),
-        ))
+        self.packageCombo = self.choice(Settings.Option.WINPACKAGE, [
+            ("EXE installer", Platform.Package.EXE.name),
+            ("ZIP archive", Platform.Package.ZIP.name),
+        ])
 
         autoCheck = QCheckBox("Check for updates on startup")
         autoCheck.setToolTip("Check the selected target when the updater opens; no automatic download or installation")
@@ -201,93 +202,117 @@ class Window(QWidget):
                 (self.installCheck, Settings.Option.INSTALL),
                 (self.prepareCheck, Settings.Option.MACSIGNER),
                 (self.cleanupCheck, Settings.Option.CLEANUP),
-                (self.systemCheck, Settings.Option.WINSYSTEM),
+                (self.systemCheck,  Settings.Option.WINSYSTEM),
                 (self.desktopCheck, Settings.Option.DESKTOP)):
-            checkbox.setChecked(self.settings.get(option) == "true")
+            checkbox.setChecked(self.settings.get(option))
             checkbox.toggled.connect(lambda checked, key=option: (
-                self.settings.set(key, "true" if checked else "false"),
+                self.settings.set(key, checked),
                 self.apply(),
             ))
 
         refreshButton = QPushButton("Manual refresh")
         refreshButton.setToolTip("Check for updates now")
-        refreshButton.clicked.connect(checkButton.click)
+        refreshButton.clicked.connect(checkButton.clicked)
         autoCheck.toggled.connect(refreshButton.setVisible)
-        self.settingsLayout.addRow(self.row(autoCheck, refreshButton))
-        refreshButton.setVisible(autoCheck.isChecked())
-        self.settingsLayout.addRow(self.row(self.extractCheck))
-        self.settingsLayout.addRow(self.row(self.installCheck))
-        self.installDirectory = self.directory(Settings.Option.INSTALLDIR)
-        self.settingsLayout.addRow("Install folder", self.installDirectory)
-        self.settingsLayout.addRow(self.row(self.cleanupCheck))
+        autoCheck.toggled.connect(lambda enabled: checkButton.setVisible(not enabled))
 
-        self.settingsLayout.addRow(self.row(self.prepareCheck))
-        self.settingsLayout.addRow("Windows package", self.packageCombo)
-        self.settingsLayout.addRow(self.row(self.systemCheck))
-        self.settingsLayout.addRow(self.row(self.desktopCheck))
-
-        self.proxyMode = QComboBox()
-        for mode in Proxy.Mode:
-            self.proxyMode.addItem(mode.name.title(), mode)
-        try:
-            mode = Proxy.Mode[self.settings.get(Settings.Option.PROXYMODE).upper()]
-        except KeyError:
-            mode = Proxy.Mode.SYSTEM
-        self.proxyMode.setCurrentIndex(mode.value)
-        self.proxyMode.currentIndexChanged.connect(lambda: (
-            self.settings.set(Settings.Option.PROXYMODE, self.proxyMode.currentData().name),
-            self.apply(),
-        ))
-        self.settingsLayout.addRow("Proxy", self.proxyMode)
+        self.proxyMode = self.choice(Settings.Option.PROXYMODE,
+                                     [(mode.name.title(), mode.name) for mode in Proxy.Mode])
         self.proxyHost = QLineEdit(self.settings.get(Settings.Option.PROXYHOST))
         self.proxyHost.setMinimumWidth(240)
         self.proxyHost.setPlaceholderText("proxy.example.com")
         self.proxyHost.setToolTip("Hostname only; authenticated proxies are not supported yet")
         self.proxyHost.editingFinished.connect(
             lambda: self.settings.set(Settings.Option.PROXYHOST, self.proxyHost.text().strip()))
-        self.settingsLayout.addRow("Proxy host", self.proxyHost)
         self.proxyPort = QSpinBox()
         self.proxyPort.setRange(1, 65535)
         self.proxyPort.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        try:
-            port = int(self.settings.get(Settings.Option.PROXYPORT))
-        except ValueError:
-            port = 8080
-        self.proxyPort.setValue(port)
+        self.proxyPort.setValue(self.settings.get(Settings.Option.PROXYPORT))
         self.proxyPort.valueChanged.connect(
-            lambda value: self.settings.set(Settings.Option.PROXYPORT, str(value)))
-        self.settingsLayout.addRow("Proxy port", self.proxyPort)
+            lambda value: self.settings.set(Settings.Option.PROXYPORT, value))
 
-        for combo in (self.platformCombo, self.packageCombo, self.proxyMode):
-            combo.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        # Qt 5 forms keep the spacing of hidden rows, so whatever hides is a
+        # section of its own; only this system's options are added at all
+        self.labels = {}
+        system = self.platform.system()
+        general = self.box("General", self.section(
+            ("Platform", self.platformCombo),
+            ("Download folder", self.directory(Settings.Option.DOWNLOADDIR)),
+            self.row(autoCheck, refreshButton)))
+        self.installDirectory = self.directory(Settings.Option.INSTALLDIR)
+        if system == "windows":
+            self.exeSection = self.section(self.row(self.installCheck), self.row(self.systemCheck))
+            self.zipSection = self.section(self.row(self.extractCheck),
+                                           ("Install folder", self.installDirectory),
+                                           self.row(self.desktopCheck))
+            sections = (self.section(("Package", self.packageCombo)), self.exeSection,
+                        self.zipSection, self.section(self.row(self.cleanupCheck)))
+        else:
+            rows = [self.row(self.extractCheck), self.row(self.installCheck),
+                    ("Install folder", self.installDirectory), self.row(self.cleanupCheck)]
+            if system == "macos":
+                rows.append(self.row(self.prepareCheck))
+            sections = (self.section(*rows),)
+        self.platformBox = self.box(
+            {"macos": "macOS", "windows": "Windows", "linux": "Linux"}.get(system, ""), *sections)
+        self.manualSection = self.section(("Host", self.proxyHost), ("Port", self.proxyPort))
+        proxy = self.box("Proxy", self.section(("Mode", self.proxyMode)), self.manualSection)
 
-        settingsPanel.hide()
-        settingsButton.toggled.connect(lambda visible: (
-            settingsPanel.setVisible(visible),
-            QTimer.singleShot(0, lambda: self.setFixedHeight(self.sizeHint().height())),
-        ))
-
-        self.progress = QProgressBar()
-
-        progress = QHBoxLayout()
-        progress.addWidget(self.progress)
-        progress.addWidget(urlButton)
-
-        actions = QHBoxLayout()
-        actions.addWidget(checkButton)
-        actions.addWidget(self.actionButton)
-        actions.addStretch()
-        actions.addWidget(settingsButton)
-
-        layout = QVBoxLayout(self)
-        layout.setSizeConstraint(QLayout.SetNoConstraint)
-        layout.addLayout(status)
-        layout.addLayout(progress)
-        layout.addLayout(actions)
-        layout.addWidget(settingsPanel)
-        autoCheck.toggled.connect(lambda enabled: checkButton.setVisible(not enabled))
+        width = max(label.sizeHint().width() for label in self.labels.values())
+        for label in self.labels.values():
+            label.setFixedWidth(width)
+        refreshButton.setVisible(autoCheck.isChecked())
         checkButton.setVisible(not autoCheck.isChecked())
-        self.apply()
+
+        settingsPanel = QWidget()
+        layout = QVBoxLayout(settingsPanel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        for box in (general, self.platformBox, proxy):
+            layout.addWidget(box)
+        return settingsPanel
+
+    @staticmethod
+    def box(title, *sections):
+        box = QGroupBox(title)
+        layout = QVBoxLayout(box)
+        for section in sections:
+            layout.addWidget(section)
+        return box
+
+    def section(self, *rows):
+        """A form of (label, field) pairs and full-width rows."""
+        widget = QWidget()
+        layout = QFormLayout(widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setFormAlignment(Qt.AlignLeft | Qt.AlignTop)
+        layout.setLabelAlignment(Qt.AlignLeft)
+        layout.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        for row in rows:
+            if isinstance(row, tuple):
+                text, field = row
+                self.labels[field] = QLabel(text)
+                layout.addRow(self.labels[field], field)
+            else:
+                layout.addRow(row)
+        return widget
+
+    def choice(self, option, items):
+        combo = QComboBox()
+        combo.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        for label, value in items:
+            combo.addItem(label, value)
+        index = combo.findData(self.settings.get(option))
+        combo.setCurrentIndex(index if index >= 0 else combo.findData(self.settings.defaults[option]))
+        combo.currentIndexChanged.connect(lambda: (
+            self.settings.set(option, combo.currentData()),
+            self.apply(),
+        ))
+        return combo
+
+    def event(self, event):
+        if event.type() == QEvent.LayoutRequest:
+            self.setFixedHeight(self.sizeHint().height())
+        return super().event(event)
 
     @staticmethod
     def row(checkbox, button=None):
@@ -303,6 +328,7 @@ class Window(QWidget):
     def directory(self, option):
         widget = QWidget()
         edit = QLineEdit(self.settings.get(option))
+        edit.setReadOnly(True)
         edit.setMinimumWidth(240)
         edit.textChanged.connect(lambda value: self.settings.set(option, value))
         browse = QPushButton("Browse…")
@@ -322,29 +348,27 @@ class Window(QWidget):
         system = self.platform.system()
         windows = native and system == "windows"
         macos = native and system == "macos"
-        exe = windows and self.packageCombo.currentData() == Platform.Package.EXE
+        exe = windows and self.packageCombo.currentData() == Platform.Package.EXE.name
         portable = windows and not exe
         extract = native and not exe and self.extractCheck.isChecked()
-        install = native and not portable and (exe or extract) and self.installCheck.isChecked()
-        destination = (install and not exe) or (portable and extract)
-        manual = self.proxyMode.currentData() == Proxy.Mode.MANUAL
-        for widget, applicable in (
-                (self.extractCheck.parentWidget(), native and not exe),
-                (self.installCheck.parentWidget(), native and not portable and (exe or extract)),
-                (self.installDirectory, destination),
-                (self.cleanupCheck.parentWidget(), install or (portable and extract)),
-                (self.prepareCheck.parentWidget(), extract and macos),
-                (self.packageCombo, windows),
-                (self.systemCheck.parentWidget(), install and exe),
-                (self.desktopCheck.parentWidget(), portable and extract),
-                (self.proxyHost, manual),
-                (self.proxyPort, manual)):
-            widget.setVisible(applicable)
-            widget.setEnabled(applicable)
-            label = self.settingsLayout.labelForField(widget)
-            if label is not None:
-                label.setVisible(applicable)
-                label.setEnabled(applicable)
+        install = (exe or (extract and not portable)) and self.installCheck.isChecked()
+        manual = self.proxyMode.currentData() == Proxy.Mode.MANUAL.name
+        self.platformBox.setVisible(native)
+        if system == "windows":
+            self.exeSection.setVisible(exe)
+            self.zipSection.setVisible(not exe)
+        for widget, enabled in (
+                (self.extractCheck, not exe),
+                (self.installCheck, exe or (extract and not portable)),
+                (self.installDirectory, (install and not exe) or (portable and extract)),
+                (self.cleanupCheck, install or (portable and extract)),
+                (self.prepareCheck, extract and macos),
+                (self.systemCheck, install and exe),
+                (self.desktopCheck, portable and extract)):
+            widget.setEnabled(enabled)
+            if widget in self.labels:
+                self.labels[widget].setEnabled(enabled)
+        self.manualSection.setVisible(manual)
         self.installCheck.setText("Run Chromium installer" if exe else "Install extracted Chromium")
 
         if install:
@@ -354,7 +378,6 @@ class Window(QWidget):
         else:
             action = "Download"
         self.actionButton.setText(action)
-        QTimer.singleShot(0, lambda: self.setFixedHeight(self.sizeHint().height()))
 
 
 if __name__ == "__main__":
