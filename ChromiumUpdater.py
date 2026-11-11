@@ -85,10 +85,10 @@ class Settings:
         CLEANUP     = "Cleanup"
         DOWNLOADDIR = "Directory/Download"
         INSTALLDIR  = "Directory/Install"
-        MACSIGNER   = "Mac/Sign"
+        MACSIGN     = "Mac/Sign"
         WINPACKAGE  = "Win/Package"
         WINSYSTEM   = "Win/System"
-        DESKTOP     = "Win/Desktop"
+        WINDESKTOP  = "Win/Desktop"
         PROXYMODE   = "Proxy/Mode"
         PROXYHOST   = "Proxy/Host"
         PROXYPORT   = "Proxy/Port"
@@ -103,10 +103,10 @@ class Settings:
             self.Option.CLEANUP:        False,
             self.Option.DOWNLOADDIR:    platform.directory(Platform.Directory.DOWNLOAD),
             self.Option.INSTALLDIR:     platform.directory(Platform.Directory.INSTALL),
-            self.Option.MACSIGNER:      True,
+            self.Option.MACSIGN:        True,
             self.Option.WINPACKAGE:     Platform.Package.EXE.name,
             self.Option.WINSYSTEM:      False,
-            self.Option.DESKTOP:        False,
+            self.Option.WINDESKTOP:     False,
             self.Option.PROXYMODE:      Proxy.Mode.SYSTEM.name,
             self.Option.PROXYHOST:      "",
             self.Option.PROXYPORT:      8080,
@@ -200,10 +200,10 @@ class Window(QWidget):
                 (autoCheck, Settings.Option.AUTOCHECK),
                 (self.extractCheck, Settings.Option.EXTRACT),
                 (self.installCheck, Settings.Option.INSTALL),
-                (self.prepareCheck, Settings.Option.MACSIGNER),
+                (self.prepareCheck, Settings.Option.MACSIGN),
                 (self.cleanupCheck, Settings.Option.CLEANUP),
                 (self.systemCheck,  Settings.Option.WINSYSTEM),
-                (self.desktopCheck, Settings.Option.DESKTOP)):
+                (self.desktopCheck, Settings.Option.WINDESKTOP)):
             checkbox.setChecked(self.settings.get(option))
             checkbox.toggled.connect(lambda checked, key=option: (
                 self.settings.set(key, checked),
@@ -361,7 +361,7 @@ class Window(QWidget):
                 (self.extractCheck, not exe),
                 (self.installCheck, exe or (extract and not portable)),
                 (self.installDirectory, (install and not exe) or (portable and extract)),
-                (self.cleanupCheck, install or (portable and extract)),
+                (self.cleanupCheck, extract or (install and exe)),
                 (self.prepareCheck, extract and macos),
                 (self.systemCheck, install and exe),
                 (self.desktopCheck, portable and extract)):
