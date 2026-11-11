@@ -4,13 +4,14 @@ Reference project: `~/Projects/ChromiumUpdaterQt` (keep its compact workflow, no
 
 ## Status
 
-Done: window, entry point, icon, Windows app ID, persistent typed settings, grouped settings panel.
-Not started: checking, downloading, workers, extraction, installation, signing, packaging.
+Done: window, entry point, icon, Windows app ID, persistent typed settings, grouped settings panel, update check, segmented download with MD5 verification and retry until cancelled.
+Not started: extraction, installation, signing, packaging.
 
 Next:
 
+- Proxy variables: in System mode, use `https_proxy`/`HTTPS_PROXY`, then `http_proxy`, when set; Qt only reads `http_proxy`, and only on Linux. No `no_proxy`.
+- Chunk queue: split the file into 4 MB chunks (1 MB on slow lines) and keep the connections busy taking the next chunk, so one slow connection no longer drags the end. Check first whether Qt 6's HTTP/2 puts all connections on one TCP connection.
 - "Remove download" applies only when extracting. Decide the Windows EXE case (hide it, or keep it for the installer) during the Windows work; for now it stays enabled there once the installer runs.
-- Then the update check and downloader (phase 1).
 
 ## Scope
 

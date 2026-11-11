@@ -150,6 +150,22 @@ class Downloader(QObject):
     SERVER = "https://storage.googleapis.com/chromium-browser-snapshots"
     # Milliseconds between progress reports
     INTERVAL = 200
+    # Milliseconds without any data before a request gives up
+    TIMEOUT = 15000
+    # Milliseconds before a dropped segment is requested again; it retries until cancelled
+    DELAY = 2000
+    # Errors a bad or lost network gives; a transfer timeout ends as OperationCanceledError, like a cancel does
+    RETRIABLE = (
+        QNetworkReply.NetworkError.ConnectionRefusedError,
+        QNetworkReply.NetworkError.RemoteHostClosedError,
+        QNetworkReply.NetworkError.HostNotFoundError,
+        QNetworkReply.NetworkError.TimeoutError,
+        QNetworkReply.NetworkError.OperationCanceledError,
+        QNetworkReply.NetworkError.TemporaryNetworkFailureError,
+        QNetworkReply.NetworkError.UnknownNetworkError,
+        QNetworkReply.NetworkError.ProxyConnectionClosedError,
+        QNetworkReply.NetworkError.ProxyTimeoutError,
+    )
 
     class Result(Enum):
         DONE      = 0
@@ -170,8 +186,7 @@ class Downloader(QObject):
 
     def request(self, url):
         request = QNetworkRequest(QUrl(url))
-        # Gives up after this long without any data, not after this long in total
-        request.setTransferTimeout(15000)
+        request.setTransferTimeout(self.TIMEOUT)
         return request
 
     @Slot(str, str, int)
@@ -199,11 +214,10 @@ class Downloader(QObject):
     @Slot(str, str, int)
     def download(self, url, path, segments):
         """Fetches url into path in parallel ranges, through path.part."""
-        head = self.manager.head(self.request(url))
         part = QFile(path + ".part")
-        self.replies = [head]
         self.cancelled = False
         size, md5, step, received = 0, "", 0, []
+        ranged, left = False, 0
         clock = QElapsedTimer()
         clock.start()
 
@@ -246,17 +260,43 @@ class Downloader(QObject):
                     clock.restart()
                     self.progress.emit(sum(received), size)
 
-        def finished(reply, expected):
+        def fetch(index):
+            """Requests what is left of segment index."""
+            request = self.request(url)
+            if ranged:
+                request.setRawHeader(
+                    b"Range", f"bytes={index * step + received[index]}-{min(size, (index + 1) * step) - 1}".encode())
+            reply = self.manager.get(request)
+            reply.readyRead.connect(lambda: write(reply, index))
+            reply.finished.connect(lambda: finished(reply, index))
+            self.replies.append(reply)
+
+        def retry(index):
+            # The download may have failed or been cancelled meanwhile
+            if not part.isOpen():
+                return
+            if self.cancelled:
+                fail("")
+            else:
+                fetch(index)
+
+        def finished(reply, index):
+            nonlocal left
             reply.deleteLater()
             status = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
             if reply not in self.replies:
                 return
             self.replies.remove(reply)
-            if reply.error() != QNetworkReply.NetworkError.NoError:
+            if not self.cancelled and ranged and reply.error() in self.RETRIABLE:
+                QTimer.singleShot(self.DELAY, lambda: retry(index))
+            elif reply.error() != QNetworkReply.NetworkError.NoError:
                 fail(reply.errorString())
-            elif status != expected:
+            elif status != (206 if ranged else 200):
                 fail(f"unexpected HTTP status {status}")
-            elif not self.replies:
+            else:
+                left -= 1
+                if left:
+                    return
                 part.close()
                 if not intact(part.fileName()):
                     fail("the file is incomplete or does not match the server's checksum")
@@ -266,8 +306,19 @@ class Downloader(QObject):
                     self.progress.emit(size, size)
                     self.finished.emit(self.Result.DONE, "")
 
-        def described():
-            nonlocal size, md5, step
+        def describe():
+            head = self.manager.head(self.request(url))
+            self.replies = [head]
+            head.finished.connect(lambda: described(head))
+
+        def redescribe():
+            if self.cancelled:
+                fail("")
+            else:
+                describe()
+
+        def described(head):
+            nonlocal size, md5, step, ranged, left
             head.deleteLater()
             self.replies = []
             size = head.header(QNetworkRequest.KnownHeaders.ContentLengthHeader) or 0
@@ -276,7 +327,9 @@ class Downloader(QObject):
             ranged = bytes(head.rawHeader(b"accept-ranges")) == b"bytes"
             count = segments if ranged else 1
             step = -(-size // count)
-            if head.error() != QNetworkReply.NetworkError.NoError:
+            if not self.cancelled and head.error() in self.RETRIABLE:
+                QTimer.singleShot(self.DELAY, redescribe)
+            elif head.error() != QNetworkReply.NetworkError.NoError:
                 fail(head.errorString())
             elif size <= 0:
                 fail("the server did not report a size")
@@ -290,22 +343,17 @@ class Downloader(QObject):
                 fail(part.errorString())
             else:
                 received.extend([0] * count)
+                left = count
                 for index in range(count):
-                    request = self.request(url)
-                    if ranged:
-                        request.setRawHeader(
-                            b"Range", f"bytes={index * step}-{min(size, (index + 1) * step) - 1}".encode())
-                    reply = self.manager.get(request)
-                    reply.readyRead.connect(lambda reply=reply, index=index: write(reply, index))
-                    reply.finished.connect(lambda reply=reply: finished(reply, 206 if ranged else 200))
-                    self.replies.append(reply)
-        head.finished.connect(described)
+                    fetch(index)
+        describe()
 
     @Slot()
     def cancel(self):
-        # The first reply's error takes the rest down with it
+        # The first reply's error takes the rest down with it; a segment
+        # waiting to retry sees the flag when its pause ends
+        self.cancelled = True
         if self.replies:
-            self.cancelled = True
             self.replies[0].abort()
 
 
@@ -369,8 +417,8 @@ class Window(QWidget):
         self.apply()
 
         self.downloader = Downloader()
-        self.downloadThread = QThread(self)
-        self.downloader.moveToThread(self.downloadThread)
+        self.worker = QThread(self)
+        self.downloader.moveToThread(self.worker)
         self.proxied.connect(self.downloader.proxy)
         self.requested.connect(self.downloader.check)
         self.ordered.connect(self.downloader.download)
@@ -378,7 +426,7 @@ class Window(QWidget):
         self.downloader.checked.connect(self.checked)
         self.downloader.progress.connect(self.progressed)
         self.downloader.finished.connect(self.finished)
-        self.downloadThread.start()
+        self.worker.start()
         self.checkButton.clicked.connect(self.check)
         if self.settings.get(Settings.Option.CHECK):
             QTimer.singleShot(0, self.check)
@@ -646,11 +694,16 @@ class Window(QWidget):
         self.ordered.emit(
             self.url, f"{self.settings.get(Settings.Option.DOWNLOADDIR)}/{folder}/{self.revision}/{file}",
             self.settings.get(Settings.Option.SEGMENTS))
+        self.clock = QElapsedTimer()
+        self.clock.start()
 
     def progressed(self, received, total):
         self.progress.setRange(0, total)
         self.progress.setValue(received)
-        self.status.setText(f"Downloading… {received >> 20} of {total >> 20} MB")
+        # Average since the download started
+        speed = received * 1000 // max(self.clock.elapsed(), 1)
+        rate = f"{speed / (1 << 20):.1f} MB/s" if speed >= 1 << 20 else f"{speed >> 10} KB/s"
+        self.status.setText(f"Downloading… {received >> 20} of {total >> 20} MB · {rate}")
 
     def finished(self, result, message):
         self.work(False)
@@ -662,8 +715,8 @@ class Window(QWidget):
         self.status.setText("Cancelled" if result == Downloader.Result.CANCELLED else message)
 
     def closeEvent(self, event):
-        self.downloadThread.quit()
-        self.downloadThread.wait()
+        self.worker.quit()
+        self.worker.wait()
         super().closeEvent(event)
 
 
