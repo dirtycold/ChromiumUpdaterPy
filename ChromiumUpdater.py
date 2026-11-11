@@ -1,11 +1,16 @@
 """Chromium Updater: a compact Qt window, built one step at a time."""
 
+import base64
+import hashlib
 import sys
 from enum import Enum
 from pathlib import Path
 
-from qtpy.QtCore    import  QEvent, QSettings, QStandardPaths, QSysInfo, Qt
+from qtpy.QtCore    import  QDir, QElapsedTimer, QEvent, QFile, QFileInfo, QIODevice, QObject, QSettings, \
+                            QStandardPaths, QSysInfo, QThread, QTimer, QUrl, Qt, Signal, Slot
 from qtpy.QtGui     import  QIcon
+from qtpy.QtNetwork import  QNetworkAccessManager, QNetworkProxy, QNetworkProxyFactory, \
+                            QNetworkReply, QNetworkRequest
 from qtpy.QtWidgets import (QApplication, QCheckBox, QComboBox, QFileDialog, 
                             QFormLayout, QGroupBox, QHBoxLayout, QLabel, 
                             QLayout, QLineEdit, QProgressBar, QPushButton, 
@@ -68,6 +73,21 @@ class Platform:
             "linux":    QStandardPaths.writableLocation(QStandardPaths.HomeLocation) + "/.local/opt/chromium",
         }.get(self.os, "")
 
+    @staticmethod
+    def remote(target, package):
+        """Snapshot folder and file name on the server; no folder when there is no snapshot."""
+        folder = {
+            "macos-arm64":      "Mac_Arm",
+            "macos-x64":        "Mac",
+            "windows-arm64":    "Win_Arm64",
+            "windows-x64":      "Win_x64",
+            "windows-x86":      "Win",
+            "linux-x64":        "Linux_x64",
+        }.get(target, "")
+        if target.startswith("windows"):
+            return folder, "mini_installer.exe" if package == Platform.Package.EXE.name else "chrome-win.zip"
+        return folder, "chrome-mac.zip" if target.startswith("macos") else "chrome-linux.zip"
+
 
 class Proxy:
     class Mode(Enum):
@@ -79,7 +99,7 @@ class Proxy:
 class Settings:
     class Option(Enum):
         PLATFORM    = "Platform"
-        AUTOCHECK   = "AutoCheck"
+        CHECK       = "Check"
         EXTRACT     = "Extract"
         INSTALL     = "Install"
         CLEANUP     = "Cleanup"
@@ -92,15 +112,17 @@ class Settings:
         PROXYMODE   = "Proxy/Mode"
         PROXYHOST   = "Proxy/Host"
         PROXYPORT   = "Proxy/Port"
+        SEGMENTS    = "Segments"
 
     def __init__(self, platform: Platform):
         self.setting = QSettings()
         self.defaults = {
             self.Option.PLATFORM:       platform.current(),
-            self.Option.AUTOCHECK:      False,
+            self.Option.CHECK:          False,
+            self.Option.SEGMENTS:       4,
             self.Option.EXTRACT:        platform.system() in {"macos", "windows"},
             self.Option.INSTALL:        platform.system() in {"macos", "windows"},
-            self.Option.CLEANUP:        False,
+            self.Option.CLEANUP:        2,
             self.Option.DOWNLOADDIR:    platform.directory(Platform.Directory.DOWNLOAD),
             self.Option.INSTALLDIR:     platform.directory(Platform.Directory.INSTALL),
             self.Option.MACSIGN:        True,
@@ -123,13 +145,186 @@ class Settings:
         self.setting.setValue(option.value, type(self.defaults[option])(value))
 
 
+class Downloader(QObject):
+    """Lives in its own thread; everything crossing over goes through a signal."""
+    SERVER = "https://storage.googleapis.com/chromium-browser-snapshots"
+    # Milliseconds between progress reports
+    INTERVAL = 200
+
+    class Result(Enum):
+        DONE      = 0
+        FAILED    = 1
+        CANCELLED = 2
+
+    checked = Signal(str, str, int)
+    progress = Signal(int, int)
+    # A Result, and the reason when it failed
+    finished = Signal(object, str)
+
+    def __init__(self):
+        super().__init__()
+        QNetworkProxyFactory.setUseSystemConfiguration(True)
+        self.manager = QNetworkAccessManager(self)
+        self.replies = []
+        self.cancelled = False
+
+    def request(self, url):
+        request = QNetworkRequest(QUrl(url))
+        # Gives up after this long without any data, not after this long in total
+        request.setTransferTimeout(15000)
+        return request
+
+    @Slot(str, str, int)
+    def proxy(self, mode, host, port):
+        self.manager.setProxy({
+            Proxy.Mode.DIRECT.name: QNetworkProxy(QNetworkProxy.ProxyType.NoProxy),
+            Proxy.Mode.MANUAL.name: QNetworkProxy(QNetworkProxy.ProxyType.HttpProxy, host, port),
+        }.get(mode, QNetworkProxy(QNetworkProxy.ProxyType.DefaultProxy)))
+
+    @Slot(str, str)
+    def check(self, folder, file):
+        reply = self.manager.get(self.request(f"{self.SERVER}/{folder}/LAST_CHANGE"))
+
+        def finished():
+            reply.deleteLater()
+            text = bytes(reply.readAll()).decode("ascii", "replace").strip()
+            if reply.error() != QNetworkReply.NetworkError.NoError:
+                self.finished.emit(self.Result.FAILED, f"Check failed: {reply.errorString()}")
+            elif not text.isdigit() or int(text) <= 0:
+                self.finished.emit(self.Result.FAILED, "Check failed: unexpected revision reply")
+            else:
+                self.checked.emit(folder, file, int(text))
+        reply.finished.connect(finished)
+
+    @Slot(str, str, int)
+    def download(self, url, path, segments):
+        """Fetches url into path in parallel ranges, through path.part."""
+        head = self.manager.head(self.request(url))
+        part = QFile(path + ".part")
+        self.replies = [head]
+        self.cancelled = False
+        size, md5, step, received = 0, "", 0, []
+        clock = QElapsedTimer()
+        clock.start()
+
+        def fail(message):
+            # Aborting a reply finishes it with an error; it is no longer listed by then
+            replies, self.replies = self.replies, []
+            for reply in replies:
+                reply.abort()
+            part.close()
+            part.remove()
+            if self.cancelled:
+                self.finished.emit(self.Result.CANCELLED, "")
+            else:
+                self.finished.emit(self.Result.FAILED, f"Download failed: {message}")
+
+        def intact(name):
+            """Whether name has the server's size and MD5."""
+            if QFileInfo(name).size() != size:
+                return False
+            digest = hashlib.md5()
+            try:
+                with open(name, "rb") as file:
+                    while chunk := file.read(1 << 20):
+                        digest.update(chunk)
+            except OSError:
+                return False
+            return base64.b64encode(digest.digest()).decode() == md5
+
+        def write(reply, index):
+            if reply in self.replies:
+                data = reply.readAll()
+                part.seek(index * step + received[index])
+                # The file is full size from the start, so a short write would go unnoticed later
+                if part.write(data) != len(data):
+                    fail(part.errorString())
+                    return
+                received[index] += len(data)
+                # Every chunk would flood the window with updates
+                if clock.elapsed() > self.INTERVAL:
+                    clock.restart()
+                    self.progress.emit(sum(received), size)
+
+        def finished(reply, expected):
+            reply.deleteLater()
+            status = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
+            if reply not in self.replies:
+                return
+            self.replies.remove(reply)
+            if reply.error() != QNetworkReply.NetworkError.NoError:
+                fail(reply.errorString())
+            elif status != expected:
+                fail(f"unexpected HTTP status {status}")
+            elif not self.replies:
+                part.close()
+                if not intact(part.fileName()):
+                    fail("the file is incomplete or does not match the server's checksum")
+                elif (QFile.exists(path) and not QFile.remove(path)) or not part.rename(path):
+                    fail(part.errorString())
+                else:
+                    self.progress.emit(size, size)
+                    self.finished.emit(self.Result.DONE, "")
+
+        def described():
+            nonlocal size, md5, step
+            head.deleteLater()
+            self.replies = []
+            size = head.header(QNetworkRequest.KnownHeaders.ContentLengthHeader) or 0
+            hashes = bytes(head.rawHeader(b"x-goog-hash")).decode("ascii", "replace")
+            md5 = next((each.strip()[4:] for each in hashes.split(",") if each.strip().startswith("md5=")), "")
+            ranged = bytes(head.rawHeader(b"accept-ranges")) == b"bytes"
+            count = segments if ranged else 1
+            step = -(-size // count)
+            if head.error() != QNetworkReply.NetworkError.NoError:
+                fail(head.errorString())
+            elif size <= 0:
+                fail("the server did not report a size")
+            elif not md5:
+                fail("the server did not report a checksum")
+            elif intact(path):
+                self.progress.emit(size, size)
+                self.finished.emit(self.Result.DONE, "")
+            elif not QDir().mkpath(path.rsplit("/", 1)[0]) or not part.open(
+                    QIODevice.OpenModeFlag.ReadWrite | QIODevice.OpenModeFlag.Truncate) or not part.resize(size):
+                fail(part.errorString())
+            else:
+                received.extend([0] * count)
+                for index in range(count):
+                    request = self.request(url)
+                    if ranged:
+                        request.setRawHeader(
+                            b"Range", f"bytes={index * step}-{min(size, (index + 1) * step) - 1}".encode())
+                    reply = self.manager.get(request)
+                    reply.readyRead.connect(lambda reply=reply, index=index: write(reply, index))
+                    reply.finished.connect(lambda reply=reply: finished(reply, 206 if ranged else 200))
+                    self.replies.append(reply)
+        head.finished.connect(described)
+
+    @Slot()
+    def cancel(self):
+        # The first reply's error takes the rest down with it
+        if self.replies:
+            self.cancelled = True
+            self.replies[0].abort()
+
+
 class Window(QWidget):
+    proxied = Signal(str, str, int)
+    requested = Signal(str, str)
+    ordered = Signal(str, str, int)
+    aborted = Signal()
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Chromium Updater")
         self.setFixedWidth(520)
         self.platform = Platform()
         self.settings = Settings(self.platform)
+        self.remote = None
+        self.url = ""
+        self.revision = 0
+        self.active = False
 
         self.status = QLabel("Ready")
         self.targetBadge = QLabel()
@@ -142,9 +337,11 @@ class Window(QWidget):
         status.addWidget(self.status, 1)
         status.addWidget(self.targetBadge, 0, Qt.AlignRight)
 
-        checkButton = QPushButton("Check for Updates")
+        self.checkButton = QPushButton("Check for Updates")
         self.actionButton = QPushButton("Download")
-        urlButton = QPushButton("Copy URL")
+        self.actionButton.clicked.connect(self.act)
+        self.urlButton = QPushButton("Copy URL")
+        self.urlButton.clicked.connect(lambda: QApplication.clipboard().setText(self.url))
         settingsButton = QPushButton("Settings")
         settingsButton.setCheckable(True)
 
@@ -152,10 +349,10 @@ class Window(QWidget):
 
         progress = QHBoxLayout()
         progress.addWidget(self.progress)
-        progress.addWidget(urlButton)
+        progress.addWidget(self.urlButton)
 
         actions = QHBoxLayout()
-        actions.addWidget(checkButton)
+        actions.addWidget(self.checkButton)
         actions.addWidget(self.actionButton)
         actions.addStretch()
         actions.addWidget(settingsButton)
@@ -165,11 +362,26 @@ class Window(QWidget):
         layout.addLayout(status)
         layout.addLayout(progress)
         layout.addLayout(actions)
-        settingsPanel = self.panel(checkButton)
-        settingsPanel.hide()
-        layout.addWidget(settingsPanel)
-        settingsButton.toggled.connect(settingsPanel.setVisible)
+        self.settingsPanel = self.panel(self.checkButton)
+        self.settingsPanel.hide()
+        layout.addWidget(self.settingsPanel)
+        settingsButton.toggled.connect(self.settingsPanel.setVisible)
         self.apply()
+
+        self.downloader = Downloader()
+        self.downloadThread = QThread(self)
+        self.downloader.moveToThread(self.downloadThread)
+        self.proxied.connect(self.downloader.proxy)
+        self.requested.connect(self.downloader.check)
+        self.ordered.connect(self.downloader.download)
+        self.aborted.connect(self.downloader.cancel)
+        self.downloader.checked.connect(self.checked)
+        self.downloader.progress.connect(self.progressed)
+        self.downloader.finished.connect(self.finished)
+        self.downloadThread.start()
+        self.checkButton.clicked.connect(self.check)
+        if self.settings.get(Settings.Option.CHECK):
+            QTimer.singleShot(0, self.check)
 
     def panel(self, checkButton):
         target = self.settings.get(Settings.Option.PLATFORM)
@@ -190,18 +402,15 @@ class Window(QWidget):
         self.prepareCheck = QCheckBox("Prepare Chromium for macOS")
         self.prepareCheck.setToolTip(
             "Remove quarantine; repair only the outer app signature for the known resource error.")
-        self.cleanupCheck = QCheckBox("Remove download after setup")
-        self.cleanupCheck.setToolTip("Only after the requested extraction or installation succeeds")
         self.systemCheck = QCheckBox("Install system-wide for Windows")
         self.systemCheck.setToolTip("Windows EXE installer: --system-level; requires administrator approval")
         self.desktopCheck = QCheckBox("Create desktop shortcut for Windows")
         self.desktopCheck.setToolTip("Windows ZIP extraction only")
         for checkbox, option in (
-                (autoCheck, Settings.Option.AUTOCHECK),
+                (autoCheck, Settings.Option.CHECK),
                 (self.extractCheck, Settings.Option.EXTRACT),
                 (self.installCheck, Settings.Option.INSTALL),
                 (self.prepareCheck, Settings.Option.MACSIGN),
-                (self.cleanupCheck, Settings.Option.CLEANUP),
                 (self.systemCheck,  Settings.Option.WINSYSTEM),
                 (self.desktopCheck, Settings.Option.WINDESKTOP)):
             checkbox.setChecked(self.settings.get(option))
@@ -225,11 +434,21 @@ class Window(QWidget):
         self.proxyHost.editingFinished.connect(
             lambda: self.settings.set(Settings.Option.PROXYHOST, self.proxyHost.text().strip()))
         self.proxyPort = QSpinBox()
-        self.proxyPort.setRange(1, 65535)
-        self.proxyPort.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        self.proxyPort.setValue(self.settings.get(Settings.Option.PROXYPORT))
-        self.proxyPort.valueChanged.connect(
-            lambda value: self.settings.set(Settings.Option.PROXYPORT, value))
+        segments = QSpinBox()
+        segments.setToolTip("Parallel connections for one download")
+        cleanup = QSpinBox()
+        cleanup.setToolTip("Recent revisions kept per platform; 0 removes the download after successful extraction")
+        for spin, option, low, high in (
+                (self.proxyPort, Settings.Option.PROXYPORT, 1, 65535),
+                (segments, Settings.Option.SEGMENTS, 1, 8),
+                (cleanup, Settings.Option.CLEANUP, 0, 9)):
+            spin.setRange(low, high)
+            spin.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+            spin.setValue(self.settings.get(option))
+            spin.valueChanged.connect(lambda value, key=option: self.settings.set(key, value))
+        # A one-digit box is too narrow; match the port's width
+        for spin in (segments, cleanup):
+            spin.setFixedWidth(self.proxyPort.sizeHint().width())
 
         # Qt 5 forms keep the spacing of hidden rows, so whatever hides is a
         # section of its own; only this system's options are added at all
@@ -238,18 +457,19 @@ class Window(QWidget):
         general = self.box("General", self.section(
             ("Platform", self.platformCombo),
             ("Download folder", self.directory(Settings.Option.DOWNLOADDIR)),
-            self.row(autoCheck, refreshButton)))
+            self.row(autoCheck, refreshButton),
+            ("Connections", segments),
+            ("Keep downloads", cleanup)))
         self.installDirectory = self.directory(Settings.Option.INSTALLDIR)
         if system == "windows":
             self.exeSection = self.section(self.row(self.installCheck), self.row(self.systemCheck))
             self.zipSection = self.section(self.row(self.extractCheck),
                                            ("Install folder", self.installDirectory),
                                            self.row(self.desktopCheck))
-            sections = (self.section(("Package", self.packageCombo)), self.exeSection,
-                        self.zipSection, self.section(self.row(self.cleanupCheck)))
+            sections = (self.section(("Package", self.packageCombo)), self.exeSection, self.zipSection)
         else:
             rows = [self.row(self.extractCheck), self.row(self.installCheck),
-                    ("Install folder", self.installDirectory), self.row(self.cleanupCheck)]
+                    ("Install folder", self.installDirectory)]
             if system == "macos":
                 rows.append(self.row(self.prepareCheck))
             sections = (self.section(*rows),)
@@ -361,7 +581,6 @@ class Window(QWidget):
                 (self.extractCheck, not exe),
                 (self.installCheck, exe or (extract and not portable)),
                 (self.installDirectory, (install and not exe) or (portable and extract)),
-                (self.cleanupCheck, extract or (install and exe)),
                 (self.prepareCheck, extract and macos),
                 (self.systemCheck, install and exe),
                 (self.desktopCheck, portable and extract)):
@@ -377,7 +596,75 @@ class Window(QWidget):
             action = "Download and Extract"
         else:
             action = "Download"
-        self.actionButton.setText(action)
+        self.actionButton.setText("Cancel" if self.active else action)
+
+        # A checked revision belongs to one server file
+        remote = Platform.remote(target, self.packageCombo.currentData())
+        if remote != self.remote:
+            self.remote = remote
+            self.url = ""
+            self.urlButton.setEnabled(False)
+            self.actionButton.setEnabled(False)
+            self.progress.setRange(0, 100)
+            self.status.setText("Ready")
+
+    def work(self, active):
+        self.active = active
+        self.settingsPanel.setEnabled(not active)
+        self.checkButton.setEnabled(not active)
+        self.apply()
+
+    def check(self):
+        folder, file = self.remote
+        if not folder:
+            self.status.setText("No snapshot for this target")
+            return
+        self.status.setText("Checking…")
+        self.progress.setRange(0, 0)
+        self.proxied.emit(self.proxyMode.currentData(), self.proxyHost.text().strip(), self.proxyPort.value())
+        self.requested.emit(folder, file)
+
+    def checked(self, folder, file, revision):
+        if (folder, file) != self.remote:
+            return
+        self.revision = revision
+        self.url = f"{Downloader.SERVER}/{folder}/{revision}/{file}"
+        self.urlButton.setEnabled(True)
+        self.actionButton.setEnabled(True)
+        self.progress.setRange(0, 100)
+        self.status.setText(f"Revision {revision} is available")
+
+    def act(self):
+        if self.active:
+            self.aborted.emit()
+            return
+        folder, file = self.remote
+        self.work(True)
+        self.status.setText("Downloading…")
+        self.progress.setRange(0, 0)
+        self.proxied.emit(self.proxyMode.currentData(), self.proxyHost.text().strip(), self.proxyPort.value())
+        self.ordered.emit(
+            self.url, f"{self.settings.get(Settings.Option.DOWNLOADDIR)}/{folder}/{self.revision}/{file}",
+            self.settings.get(Settings.Option.SEGMENTS))
+
+    def progressed(self, received, total):
+        self.progress.setRange(0, total)
+        self.progress.setValue(received)
+        self.status.setText(f"Downloading… {received >> 20} of {total >> 20} MB")
+
+    def finished(self, result, message):
+        self.work(False)
+        if result == Downloader.Result.DONE:
+            self.status.setText(f"Downloaded revision {self.revision}")
+            return
+        self.progress.setRange(0, 100)
+        self.progress.reset()
+        self.status.setText("Cancelled" if result == Downloader.Result.CANCELLED else message)
+
+    def closeEvent(self, event):
+        self.downloadThread.quit()
+        self.downloadThread.wait()
+        super().closeEvent(event)
 
 
 if __name__ == "__main__":
