@@ -17,14 +17,14 @@ from qtpy.QtCore    import (QDir, QElapsedTimer, QEvent, QFile, QFileInfo,
                             QIODevice, QLockFile, QObject, QSaveFile, QSettings, QStandardPaths, QStorageInfo,
                             QSysInfo, QThread, QTimer, QUrl, Qt, Signal, Slot,
                             )
-from qtpy.QtGui     import  QIcon
+from qtpy.QtGui     import  QDesktopServices, QIcon
 from qtpy.QtNetwork import (QNetworkAccessManager, QNetworkProxy, 
-                            QNetworkProxyFactory, QNetworkReply, QNetworkRequest,
+                            QNetworkProxyFactory, QNetworkProxyQuery, QNetworkReply, QNetworkRequest,
                             )
 from qtpy.QtWidgets import (QApplication, QCheckBox, QComboBox, QFileDialog, 
                             QFormLayout, QGroupBox, QHBoxLayout, QLabel, 
                             QLayout, QLineEdit, QProgressBar, QPushButton, 
-                            QSizePolicy, QSpinBox, QVBoxLayout, QWidget,
+                            QSizePolicy, QSpinBox, QStyle, QToolButton, QVBoxLayout, QWidget,
                             )
 
 
@@ -84,7 +84,7 @@ class Platform:
         if kind != self.Directory.INSTALL:
             return ""
         return {
-            "macos":    QStandardPaths.writableLocation(QStandardPaths.ApplicationsLocation),
+            "macos":    "/Applications",
             "windows":  QStandardPaths.writableLocation(QStandardPaths.AppLocalDataLocation) + "/Chromium",
             "linux":    QStandardPaths.writableLocation(QStandardPaths.HomeLocation) + "/.local/opt/chromium",
         }.get(self.os, "")
@@ -141,7 +141,7 @@ class Settings:
     def __init__(self, platform: Platform):
         self.setting = QSettings()
         self.defaults = {
-            self.Option.PLATFORM:       platform.current(),
+            self.Option.PLATFORM:       "",
             self.Option.CHECK:          False,
             self.Option.SEGMENTS:       4,
             self.Option.INSTALL:        platform.system() in {"macos", "windows"},
@@ -204,6 +204,7 @@ class Updater(QObject):
 
     # A pulse: the report has changed; read it for the details
     changed = Signal()
+    resolved = Signal()
     # A Result alone; the report has the details
     finished = Signal(object)
 
@@ -226,29 +227,65 @@ class Updater(QObject):
         request.setRawHeader(b"Accept-Encoding", b"identity")
         return request
 
+    @Slot(dict)
     def proxy(self, proxy):
         mode, host, port = proxy["mode"], proxy["host"], proxy["port"]
+        host = host.strip()
         self.error = ""
-        proxy = {
-            Proxy.Mode.DIRECT.name: QNetworkProxy(QNetworkProxy.ProxyType.NoProxy),
-            Proxy.Mode.MANUAL.name: QNetworkProxy(QNetworkProxy.ProxyType.HttpProxy, host, port),
-        }.get(mode, QNetworkProxy(QNetworkProxy.ProxyType.DefaultProxy))
-        if mode == Proxy.Mode.SYSTEM.name:
-            value = next((os.environ[key].strip() for key in
-                          ("https_proxy", "HTTPS_PROXY", "http_proxy", "HTTP_PROXY", "all_proxy", "ALL_PROXY")
-                          if os.environ.get(key, "").strip()), "")
-            if value:
-                url = QUrl(value)
-                kind = {"http": QNetworkProxy.ProxyType.HttpProxy,
-                        "socks5": QNetworkProxy.ProxyType.Socks5Proxy}.get(url.scheme().lower())
-                port = url.port(1080 if url.scheme().lower() == "socks5" else 80)
-                if not url.isValid() or not url.host() or kind is None or not 1 <= port <= 65535:
-                    self.error = "Invalid proxy environment URL; use http://host:port or socks5://host:port"
-                elif url.userInfo():
-                    self.error = "Authenticated proxies are not supported yet"
+        try:
+            proxy = {
+                Proxy.Mode.DIRECT.name: QNetworkProxy(QNetworkProxy.ProxyType.NoProxy),
+                Proxy.Mode.MANUAL.name: QNetworkProxy(QNetworkProxy.ProxyType.HttpProxy, host, port),
+            }.get(mode, QNetworkProxy(QNetworkProxy.ProxyType.DefaultProxy))
+            if mode == Proxy.Mode.MANUAL.name:
+                if not host:
+                    self.error = "Manual proxy needs a host"
+                    return
+                url = QUrl()
+                url.setScheme("http")
+                url.setHost(host)
+                if not url.isValid() or not url.host() or any(character.isspace() for character in host) or not 1 <= port <= 65535:
+                    self.error = "Invalid manual proxy; enter a hostname and port"
+                    return
+            if mode == Proxy.Mode.SYSTEM.name:
+                value = next((os.environ[key].strip() for key in
+                              ("https_proxy", "HTTPS_PROXY", "http_proxy", "HTTP_PROXY", "all_proxy", "ALL_PROXY")
+                              if os.environ.get(key, "").strip()), "")
+                if value:
+                    url = QUrl(value)
+                    kind = {"http": QNetworkProxy.ProxyType.HttpProxy,
+                            "socks5": QNetworkProxy.ProxyType.Socks5Proxy}.get(url.scheme().lower())
+                    port = url.port(1080 if url.scheme().lower() == "socks5" else 80)
+                    if not url.isValid() or not url.host() or kind is None or not 1 <= port <= 65535:
+                        self.error = "Invalid proxy environment URL; use http://host:port or socks5://host:port"
+                    elif url.userInfo():
+                        self.error = "Authenticated proxies are not supported yet"
+                    else:
+                        proxy = QNetworkProxy(kind, url.host(), port)
                 else:
-                    proxy = QNetworkProxy(kind, url.host(), port)
-        self.manager.setProxy(proxy)
+                    proxies = QNetworkProxyFactory.systemProxyForQuery(QNetworkProxyQuery(QUrl(self.SERVER)))
+                    proxy = next((candidate for candidate in proxies if candidate.type() in (
+                        QNetworkProxy.ProxyType.HttpProxy, QNetworkProxy.ProxyType.Socks5Proxy,
+                        QNetworkProxy.ProxyType.NoProxy)), None)
+                    if proxy is None:
+                        if proxies:
+                            self.error = "No supported system proxy was found"
+                            return
+                        proxy = QNetworkProxy(QNetworkProxy.ProxyType.NoProxy)
+                    if proxy.type() != QNetworkProxy.ProxyType.NoProxy and not proxy.hostName().strip():
+                        self.error = "System proxy has no host"
+                        return
+            self.manager.setProxy(proxy)
+        finally:
+            text = self.error or "Direct connection"
+            if not self.error and proxy.type() != QNetworkProxy.ProxyType.NoProxy:
+                url = QUrl()
+                url.setScheme("socks5" if proxy.type() == QNetworkProxy.ProxyType.Socks5Proxy else "http")
+                url.setHost(proxy.hostName())
+                url.setPort(proxy.port())
+                text = url.toString()
+            self.route = {"mode": mode, "text": text, "valid": not bool(self.error)}
+            self.resolved.emit()
 
     @staticmethod
     def snapshot(stage, folder, file, revision):
@@ -725,8 +762,12 @@ class Updater(QObject):
             self.replies[0].abort()
 
 class Window(QWidget):
+    # Seconds required to hold Reset settings
+    RESET = 3
+
     queried = Signal(str, str, dict)
     requested = Signal(dict, dict)
+    proxied = Signal(dict)
     aborted = Signal()
 
     def __init__(self, parent=None):
@@ -738,6 +779,7 @@ class Window(QWidget):
         self.remote = None
         self.url = ""
         self.active = False
+        self.proxySelection = None
 
         self.status = QLabel("Ready")
         self.status.setTextInteractionFlags(Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
@@ -755,16 +797,15 @@ class Window(QWidget):
         self.checkButton = QPushButton("Check for Updates")
         self.actionButton = QPushButton("Download")
         self.actionButton.clicked.connect(self.act)
-        self.urlButton = QPushButton("Copy URL")
+        self.urlButton = QToolButton()
+        self.urlButton.setIcon(QIcon.fromTheme("edit-copy", self.style().standardIcon(QStyle.SP_FileIcon)))
+        self.urlButton.setToolTip("Copy download URL")
+        self.urlButton.setAccessibleName("Copy download URL")
         self.urlButton.clicked.connect(lambda: QApplication.clipboard().setText(self.url))
-        settingsButton = QPushButton("Settings")
+        settingsButton = QPushButton("Advanced …")
         settingsButton.setCheckable(True)
 
         self.progress = QProgressBar()
-
-        progress = QHBoxLayout()
-        progress.addWidget(self.progress)
-        progress.addWidget(self.urlButton)
 
         actions = QHBoxLayout()
         actions.addWidget(self.checkButton)
@@ -775,23 +816,26 @@ class Window(QWidget):
         layout = QVBoxLayout(self)
         layout.setSizeConstraint(QLayout.SetNoConstraint)
         layout.addLayout(status)
-        layout.addLayout(progress)
+        layout.addWidget(self.progress)
         layout.addLayout(actions)
         self.settingsPanel = self.panel(self.checkButton)
         self.settingsPanel.hide()
         layout.addWidget(self.settingsPanel)
-        settingsButton.toggled.connect(self.settingsPanel.setVisible)
+        settingsButton.toggled.connect(lambda visible: self.settingsPanel.setVisible(visible))
         self.apply()
 
         self.updater = Updater()
         self.worker = QThread(self)
         self.updater.moveToThread(self.worker)
+        self.proxied.connect(self.updater.proxy)
+        self.updater.resolved.connect(self.resolved)
         self.queried.connect(self.updater.check)
         self.requested.connect(self.updater.download)
         self.aborted.connect(self.updater.cancel)
         self.updater.changed.connect(self.changed)
         self.updater.finished.connect(self.finished)
         self.worker.start()
+        self.apply()
         self.checkButton.clicked.connect(self.check)
         if self.settings.get(Settings.Option.CHECK):
             QTimer.singleShot(0, self.check)
@@ -830,11 +874,18 @@ class Window(QWidget):
                 self.apply(),
             ))
 
-        refreshButton = QPushButton("Manual refresh")
+        refreshButton = QToolButton()
+        refreshButton.setIcon(self.style().standardIcon(QStyle.SP_BrowserReload))
         refreshButton.setToolTip("Check for updates now")
+        refreshButton.setAccessibleName("Check for updates now")
         refreshButton.clicked.connect(checkButton.clicked)
         autoCheck.toggled.connect(refreshButton.setVisible)
         autoCheck.toggled.connect(lambda enabled: checkButton.setVisible(not enabled))
+        checkActions = QWidget()
+        checkLayout = QHBoxLayout(checkActions)
+        checkLayout.setContentsMargins(0, 0, 0, 0)
+        checkLayout.addWidget(refreshButton)
+        checkLayout.addWidget(self.urlButton)
 
         self.proxyMode = self.choice(Settings.Option.PROXYMODE,
                                      [(mode.name.title(), mode.name) for mode in Proxy.Mode])
@@ -843,7 +894,7 @@ class Window(QWidget):
         self.proxyHost.setPlaceholderText("proxy.example.com")
         self.proxyHost.setToolTip("Hostname only; authenticated proxies are not supported yet")
         self.proxyHost.editingFinished.connect(
-            lambda: self.settings.set(Settings.Option.PROXYHOST, self.proxyHost.text().strip()))
+            lambda: (self.settings.set(Settings.Option.PROXYHOST, self.proxyHost.text().strip()), self.apply()))
         self.proxyPort = QSpinBox()
         segments = QSpinBox()
         segments.setToolTip("Parallel connections for one download")
@@ -860,6 +911,7 @@ class Window(QWidget):
         # A one-digit box is too narrow; match the port's width
         for spin in (segments, cleanup):
             spin.setFixedWidth(self.proxyPort.sizeHint().width())
+        self.proxyPort.valueChanged.connect(lambda: self.apply())
 
         # Qt 5 forms keep the spacing of hidden rows, so whatever hides is a
         # section of its own; only this system's options are added at all
@@ -868,7 +920,7 @@ class Window(QWidget):
         general = self.box("General", self.section(
             ("Platform", self.platformCombo),
             ("Download folder", self.directory(Settings.Option.DOWNLOADDIR)),
-            self.row(autoCheck, refreshButton),
+            self.row(autoCheck, checkActions),
             ("Connections", segments),
             ("Keep downloads", cleanup)))
         self.installDirectory = self.directory(Settings.Option.INSTALLDIR)
@@ -879,15 +931,17 @@ class Window(QWidget):
             sections = (self.section(("Package", self.packageCombo), self.row(self.installCheck)),
                         self.exeSection, self.zipSection)
         else:
-            rows = [self.row(self.installCheck),
+            rows = [self.row(self.installCheck, self.prepareCheck if system == "macos" else None),
                     ("Install folder", self.installDirectory)]
-            if system == "macos":
-                rows.append(self.row(self.prepareCheck))
             sections = (self.section(*rows),)
         self.platformBox = self.box(
             {"macos": "macOS", "windows": "Windows", "linux": "Linux"}.get(system, ""), *sections)
         self.manualSection = self.section(("Host", self.proxyHost), ("Port", self.proxyPort))
-        proxy = self.box("Proxy", self.section(("Mode", self.proxyMode)), self.manualSection)
+        self.proxyNotice = QLabel()
+        self.proxyNotice.setWordWrap(True)
+        self.proxyNotice.setTextInteractionFlags(Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
+        self.proxyNotice.hide()
+        proxy = self.box("Proxy", self.section(("Mode", self.proxyMode)), self.manualSection, self.proxyNotice)
 
         width = max(label.sizeHint().width() for label in self.labels.values())
         for label in self.labels.values():
@@ -900,7 +954,41 @@ class Window(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         for box in (general, self.platformBox, proxy):
             layout.addWidget(box)
+        resetButton = QPushButton("Reset settings…")
+        resetButton.setToolTip(f"Hold for {self.RESET} seconds to restore defaults. Downloaded files will be kept.")
+        resetButton.setFixedWidth(resetButton.sizeHint().width())
+        clock = QElapsedTimer()
+        timer = QTimer(resetButton)
+        timer.setInterval(50)
+
+        def countdown():
+            if not resetButton.isDown() or not resetButton.isEnabled() or not resetButton.isVisible():
+                timer.stop()
+                resetButton.setText("Reset settings…")
+            elif clock.elapsed() >= self.RESET * 1000:
+                timer.stop()
+                resetButton.setDown(False)
+                self.reset()
+            else:
+                resetButton.setText(f"Reset in {self.RESET - clock.elapsed() // 1000}…")
+
+        resetButton.pressed.connect(lambda: (clock.start(), resetButton.setText(f"Reset in {self.RESET}…"), timer.start()))
+        resetButton.released.connect(lambda: (timer.stop(), resetButton.setText("Reset settings…")))
+        timer.timeout.connect(countdown)
+        layout.addWidget(resetButton, 0, Qt.AlignLeft)
         return settingsPanel
+
+    def reset(self):
+        if self.active:
+            return
+        self.settings.setting.clear()
+        previous = self.settingsPanel
+        self.settingsPanel = self.panel(self.checkButton)
+        self.layout().replaceWidget(previous, self.settingsPanel)
+        self.settingsPanel.setVisible(previous.isVisible())
+        previous.hide()
+        previous.deleteLater()
+        self.apply()
 
     @staticmethod
     def box(title, *sections):
@@ -941,9 +1029,11 @@ class Window(QWidget):
         return combo
 
     def event(self, event):
+        handled = super().event(event)
         if event.type() == QEvent.LayoutRequest:
-            self.setFixedHeight(self.sizeHint().height())
-        return super().event(event)
+            height = self.layout().totalHeightForWidth(self.width())
+            self.setFixedHeight(height if height >= 0 else self.sizeHint().height())
+        return handled
 
     @staticmethod
     def row(checkbox, button=None):
@@ -962,17 +1052,34 @@ class Window(QWidget):
         edit.setReadOnly(True)
         edit.setMinimumWidth(240)
         edit.textChanged.connect(lambda value: self.settings.set(option, value))
-        browse = QPushButton("Browse…")
+        browse = QToolButton()
+        browse.setIcon(self.style().standardIcon(QStyle.SP_DialogOpenButton))
+        browse.setToolTip("Choose folder")
+        browse.setAccessibleName("Choose folder")
         browse.clicked.connect(lambda: edit.setText(directory) if (
             directory := QFileDialog.getExistingDirectory(self, "Choose folder", edit.text())
         ) else None)
+        openButton = QToolButton()
+        openButton.setIcon(self.style().standardIcon(QStyle.SP_DirLinkIcon))
+        openButton.setToolTip("Open selected folder")
+        openButton.setAccessibleName("Open selected folder")
+        openButton.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(edit.text())))
         layout = QHBoxLayout(widget)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(edit)
         layout.addWidget(browse)
+        layout.addWidget(openButton)
         return widget
 
     def apply(self):
+        if hasattr(self, "updater"):
+            proxy = self.proxy()
+            if proxy != self.proxySelection:
+                self.proxySelection = proxy
+                self.proxyNotice.hide()
+                self.proxied.emit(proxy)
+            elif hasattr(self.updater, "route"):
+                self.resolved()
         target = self.platformCombo.currentData() or self.platform.current()
         self.badge.setText(Platform.supported().get(target, "Unknown target"))
         native = self.platform.native(target)
@@ -1060,6 +1167,16 @@ class Window(QWidget):
     def proxy(self):
         return {"mode": self.proxyMode.currentData(),
                 "host": self.proxyHost.text().strip(), "port": self.proxyPort.value()}
+
+    def resolved(self):
+        route = self.updater.route
+        self.proxyNotice.setText(route["text"])
+        color = "40, 167, 69" if route["valid"] else "220, 53, 69"
+        self.proxyNotice.setStyleSheet(
+            f"background-color: rgba({color}, 48);"
+            f"border: 1px solid rgba({color}, 128);"
+            "border-radius: 4px; padding: 4px;")
+        self.proxyNotice.setVisible(route["mode"] != Proxy.Mode.DIRECT.name)
 
     def options(self):
         options = {option: self.settings.get(option) for option in (
