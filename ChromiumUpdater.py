@@ -570,15 +570,15 @@ class Window(QWidget):
         self.active = False
 
         self.status = QLabel("Ready")
-        self.targetBadge = QLabel()
-        self.targetBadge.setToolTip("Selected download target")
-        self.targetBadge.setStyleSheet(
+        self.badge = QLabel()
+        self.badge.setToolTip("Selected download target")
+        self.badge.setStyleSheet(
             "border: 1px solid palette(mid); border-radius: 3px; padding: 2px 6px;")
-        self.targetBadge.setFixedHeight(self.targetBadge.sizeHint().height())
+        self.badge.setFixedHeight(self.badge.sizeHint().height())
 
         status = QHBoxLayout()
         status.addWidget(self.status, 1)
-        status.addWidget(self.targetBadge, 0, Qt.AlignRight)
+        status.addWidget(self.badge, 0, Qt.AlignRight)
 
         self.checkButton = QPushButton("Check for Updates")
         self.actionButton = QPushButton("Download")
@@ -804,7 +804,7 @@ class Window(QWidget):
 
     def apply(self):
         target = self.platformCombo.currentData() or self.platform.current()
-        self.targetBadge.setText(Platform.supported().get(target, "Unknown target"))
+        self.badge.setText(Platform.supported().get(target, "Unknown target"))
         native = self.platform.native(target)
         system = self.platform.system()
         windows = native and system == "windows"
