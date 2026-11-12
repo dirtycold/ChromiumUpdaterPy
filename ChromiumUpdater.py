@@ -3,9 +3,9 @@
 import base64
 import hashlib
 import os
-import shutil
 import stat
 import sys
+import tempfile
 import zipfile
 from enum           import  Enum
 from pathlib        import  Path
@@ -474,30 +474,31 @@ class Updater(QObject):
         self.publish(stage=self.Stage.EXTRACTING, received=0, total=0, speed=0)
         clock = QElapsedTimer()
         clock.start()
-        base = Path(destination).resolve()
-        roots = set()
 
         def abort(message):
-            for root in roots:
-                shutil.rmtree(base / root, ignore_errors=True)
             if not self.cancelled:
                 self.report = {**self.report, "error": f"Extraction failed: {message}"}
             self.finished.emit(self.Result.CANCELLED if self.cancelled else self.Result.FAILED)
 
         try:
-            with zipfile.ZipFile(archive) as source:
+            output = Path(destination).resolve() / "extracted"
+            # A previous run may have left a stale or partial tree
+            # Preserve existing output; only this run's staging directory is disposable
+            if output.exists() or output.is_symlink():
+                abort(f"output already exists: {output}")
+                return
+            with tempfile.TemporaryDirectory(prefix=".extract-", dir=destination) as staging, \
+                    zipfile.ZipFile(archive) as source:
+                base = Path(staging).resolve()
                 entries = source.infolist()
                 total = sum(entry.file_size for entry in entries)
                 done = 0
-                # A previous run may have left a stale or partial tree
-                roots.update(entry.filename.split("/", 1)[0] for entry in entries)
-                roots.discard("")
-                for root in sorted(roots):
-                    spot = base / root
-                    if spot.is_dir() and not spot.is_symlink():
-                        shutil.rmtree(spot)
-                    elif spot.exists() or spot.is_symlink():
-                        spot.unlink()
+                directories = []
+                for entry in entries:
+                    name = Path(entry.filename)
+                    if name.is_absolute() or ".." in name.parts or not name.parts:
+                        abort(f"unsafe path in the archive: {entry.filename}")
+                        return
                 for entry in entries:
                     if self.cancelled:
                         abort("")
@@ -509,11 +510,12 @@ class Updater(QObject):
                         return
                     if entry.is_dir():
                         target.mkdir(parents=True, exist_ok=True)
+                        directories.append((target, entry.external_attr >> 16))
                         continue
                     target.parent.mkdir(parents=True, exist_ok=True)
                     mode = entry.external_attr >> 16
                     if stat.S_ISLNK(mode):
-                        where = source.read(entry).decode("utf-8", "replace")
+                        where = source.read(entry).decode("utf-8")
                         if Path(where).is_absolute() or not (
                                 target.parent / where).resolve().is_relative_to(base):
                             abort(f"unsafe link in the archive: {entry.filename}")
@@ -525,15 +527,27 @@ class Updater(QObject):
                     with source.open(entry) as data, open(target, "wb") as file:
                         while chunk := data.read(1 << 20):
                             if self.cancelled:
-                                abort("")
-                                return
+                                break
                             file.write(chunk)
                             done += len(chunk)
                             if clock.elapsed() > self.INTERVAL:
                                 clock.restart()
                                 self.publish(received=done, total=total)
+                    if self.cancelled:
+                        abort("")
+                        return
                     if mode:
                         os.chmod(target, mode & 0o777)
+                for directory, mode in sorted(directories, key=lambda item: len(item[0].parts), reverse=True):
+                    if mode:
+                        os.chmod(directory, mode & 0o777)
+                if self.cancelled:
+                    abort("")
+                    return
+                if output.exists() or output.is_symlink():
+                    abort(f"output already exists: {output}")
+                    return
+                base.rename(output)
             self.publish(received=total, total=total)
             self.finished.emit(self.Result.DONE)
         except (OSError, ValueError, RuntimeError, zipfile.BadZipFile) as error:
@@ -857,10 +871,16 @@ class Window(QWidget):
         self.apply()
 
     def check(self):
+        if self.active:
+            return
         folder, file = self.remote
         if not folder:
             self.status.setText("No snapshot for this target")
             return
+        self.work(True)
+        self.url = ""
+        self.urlButton.setEnabled(False)
+        self.actionButton.setEnabled(False)
         self.queried.emit(folder, file, self.options())
 
     def changed(self):
