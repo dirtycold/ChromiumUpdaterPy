@@ -123,20 +123,21 @@ class Proxy:
 
 class Settings:
     class Option(Enum):
-        PLATFORM    = "Platform"
-        CHECK       = "Check"
-        INSTALL     = "Install"
-        CLEANUP     = "Cleanup"
-        DOWNLOADDIR = "Directory/Download"
-        INSTALLDIR  = "Directory/Install"
-        MACSIGN     = "Mac/Sign"
-        WINPACKAGE  = "Win/Package"
-        WINSYSTEM   = "Win/System"
-        WINDESKTOP  = "Win/Desktop"
-        PROXYMODE   = "Proxy/Mode"
-        PROXYHOST   = "Proxy/Host"
-        PROXYPORT   = "Proxy/Port"
-        SEGMENTS    = "Segments"
+        PLATFORM        = "Platform"
+        CHECK           = "Check"
+        INSTALL         = "Install"
+        CLEANUP         = "Cleanup"
+        DOWNLOADDIR     = "Directory/Download"
+        INSTALLDIR      = "Directory/Install"
+        MACSIGN         = "Mac/Sign"
+        WINPACKAGE      = "Win/Package"
+        WINSYSTEM       = "Win/System"
+        WINDESKTOP      = "Win/Desktop"
+        LINUXDESKTOP    = "Linux/Desktop"
+        PROXYMODE       = "Proxy/Mode"
+        PROXYHOST       = "Proxy/Host"
+        PROXYPORT       = "Proxy/Port"
+        SEGMENTS        = "Segments"
 
     def __init__(self, platform: Platform):
         self.setting = QSettings()
@@ -152,6 +153,7 @@ class Settings:
             self.Option.WINPACKAGE:     Platform.Package.EXE.name,
             self.Option.WINSYSTEM:      False,
             self.Option.WINDESKTOP:     False,
+            self.Option.LINUXDESKTOP:   True,
             self.Option.PROXYMODE:      Proxy.Mode.SYSTEM.name,
             self.Option.PROXYHOST:      "",
             self.Option.PROXYPORT:      8080,
@@ -736,9 +738,26 @@ class Updater(QObject):
                     self.error = "Could not record the installed revision"
                     return self.Result.FAILED
                 success = True
+            if self.platform.system() == "linux" and options[Settings.Option.LINUXDESKTOP]:
+                directory = Path(QStandardPaths.writableLocation(QStandardPaths.ApplicationsLocation))
+                directory.mkdir(parents=True, exist_ok=True)
+                executable = str(target / "chrome")
+                if any(character in executable for character in "\n\r="):
+                    self.error = "Chromium installed, but the path cannot be used in a desktop launcher"
+                    return self.Result.FAILED
+                executable = executable.replace("\\", "\\\\\\\\").replace("%", "%%")
+                for character in ('"', '`', '$'):
+                    executable = executable.replace(character, "\\\\" + character)
+                desktop = ("[Desktop Entry]\nType=Application\nName=Chromium (snapshot)\n"
+                           f'Exec="{executable}" %U\n'
+                           "Icon=chromium\nTerminal=false\nCategories=Network;WebBrowser;\n").encode()
+                launcher = QSaveFile(str(directory / "chromium-updater.desktop"))
+                if not launcher.open(QIODevice.WriteOnly) or launcher.write(desktop) != len(desktop) or not launcher.commit():
+                    self.error = "Chromium installed, but the application launcher could not be saved"
+                    return self.Result.FAILED
             return self.Result.DONE
         except (OSError, ValueError, RuntimeError, zipfile.BadZipFile) as error:
-            self.error = f"Installation failed: {error}"
+            self.error = f"{'Launcher creation failed; Chromium is installed' if success else 'Installation failed'}: {error}"
             return self.Result.FAILED
         finally:
             if not success and (moved or replaced):
@@ -862,12 +881,17 @@ class Window(QWidget):
         self.systemCheck.setToolTip("Windows EXE installer: --system-level; requires administrator approval")
         self.desktopCheck = QCheckBox("Create desktop shortcut for Windows")
         self.desktopCheck.setToolTip("Windows ZIP installation only")
+        desktopOption = Settings.Option.WINDESKTOP
+        if self.platform.system() == "linux":
+            desktopOption = Settings.Option.LINUXDESKTOP
+            self.desktopCheck.setText("Create application launcher for Linux")
+            self.desktopCheck.setToolTip("Add Chromium to this user's application menu")
         for checkbox, option in (
                 (autoCheck, Settings.Option.CHECK),
                 (self.installCheck, Settings.Option.INSTALL),
                 (self.prepareCheck, Settings.Option.MACSIGN),
                 (self.systemCheck,  Settings.Option.WINSYSTEM),
-                (self.desktopCheck, Settings.Option.WINDESKTOP)):
+                (self.desktopCheck, desktopOption)):
             checkbox.setChecked(self.settings.get(option))
             checkbox.toggled.connect(lambda checked, key=option: (
                 self.settings.set(key, checked),
@@ -933,6 +957,8 @@ class Window(QWidget):
         else:
             rows = [self.row(self.installCheck, self.prepareCheck if system == "macos" else None),
                     ("Install folder", self.installDirectory)]
+            if system == "linux":
+                rows.append(self.row(self.desktopCheck))
             sections = (self.section(*rows),)
         self.platformBox = self.box(
             {"macos": "macOS", "windows": "Windows", "linux": "Linux"}.get(system, ""), *sections)
@@ -1099,7 +1125,7 @@ class Window(QWidget):
                 (self.installDirectory, install and not exe),
                 (self.prepareCheck, install and macos),
                 (self.systemCheck, install and exe),
-                (self.desktopCheck, install and portable)):
+                (self.desktopCheck, install and (portable or system == "linux"))):
             widget.setEnabled(enabled)
             if widget in self.labels:
                 self.labels[widget].setEnabled(enabled)
@@ -1182,7 +1208,7 @@ class Window(QWidget):
         options = {option: self.settings.get(option) for option in (
             Settings.Option.DOWNLOADDIR, Settings.Option.SEGMENTS, Settings.Option.INSTALL,
             Settings.Option.INSTALLDIR, Settings.Option.MACSIGN,
-            Settings.Option.WINSYSTEM, Settings.Option.WINDESKTOP)}
+            Settings.Option.WINSYSTEM, Settings.Option.WINDESKTOP, Settings.Option.LINUXDESKTOP)}
         options[Settings.Option.INSTALL] = self.installable
         return options
 
@@ -1203,6 +1229,8 @@ class Window(QWidget):
             self.progress.setRange(0, 100)
             self.status.setText(f"Revision {report['revision']} is available")
         else:
+            self.progress.setRange(0, 100)
+            self.progress.setValue(100)
             done = "Installed" if report["stage"] == Updater.Stage.INSTALLING else "Downloaded"
             self.status.setText(f"{done} revision {report['revision']}")
 
