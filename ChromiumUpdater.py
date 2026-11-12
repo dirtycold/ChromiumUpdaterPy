@@ -184,7 +184,7 @@ class Downloader(QObject):
         self.manager = QNetworkAccessManager(self)
         self.replies = []
         self.cancelled = False
-        self.proxyError = ""
+        self.error = ""
 
     def request(self, url):
         request = QNetworkRequest(QUrl(url))
@@ -195,7 +195,7 @@ class Downloader(QObject):
 
     @Slot(str, str, int)
     def proxy(self, mode, host, port):
-        self.proxyError = ""
+        self.error = ""
         proxy = {
             Proxy.Mode.DIRECT.name: QNetworkProxy(QNetworkProxy.ProxyType.NoProxy),
             Proxy.Mode.MANUAL.name: QNetworkProxy(QNetworkProxy.ProxyType.HttpProxy, host, port),
@@ -210,17 +210,17 @@ class Downloader(QObject):
                         "socks5": QNetworkProxy.ProxyType.Socks5Proxy}.get(url.scheme().lower())
                 port = url.port(1080 if url.scheme().lower() == "socks5" else 80)
                 if not url.isValid() or not url.host() or kind is None or not 1 <= port <= 65535:
-                    self.proxyError = "Invalid proxy environment URL; use http://host:port or socks5://host:port"
+                    self.error = "Invalid proxy environment URL; use http://host:port or socks5://host:port"
                 elif url.userInfo():
-                    self.proxyError = "Authenticated proxies are not supported yet"
+                    self.error = "Authenticated proxies are not supported yet"
                 else:
                     proxy = QNetworkProxy(kind, url.host(), port)
         self.manager.setProxy(proxy)
 
     @Slot(str, str)
     def check(self, folder, file):
-        if self.proxyError:
-            self.finished.emit(self.Result.FAILED, self.proxyError)
+        if self.error:
+            self.finished.emit(self.Result.FAILED, self.error)
             return
         reply = self.manager.get(self.request(f"{self.SERVER}/{folder}/LAST_CHANGE"))
 
@@ -238,8 +238,8 @@ class Downloader(QObject):
     @Slot(str, str, int)
     def download(self, url, path, segments):
         """Fetches url into path in parallel ranges, through path.part."""
-        if self.proxyError:
-            self.finished.emit(self.Result.FAILED, self.proxyError)
+        if self.error:
+            self.finished.emit(self.Result.FAILED, self.error)
             return
         part = QFile(path + ".part")
         self.cancelled = False

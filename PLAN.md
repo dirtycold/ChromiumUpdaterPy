@@ -4,13 +4,12 @@ Reference project: `~/Projects/ChromiumUpdaterQt` (keep its compact workflow, no
 
 ## Status
 
-Done: window, entry point, icon, Windows app ID, persistent typed settings, grouped settings panel, update check, segmented download with MD5 verification and retry until cancelled.
+Done: window, entry point, icon, Windows app ID, persistent typed settings, grouped settings panel, update check, chunk-queued download with MD5 verification, retry until cancelled, and proxy environment variables in System mode.
 Not started: extraction, installation, signing, packaging.
 
 Next:
 
-- Proxy variables: in System mode, use `https_proxy`/`HTTPS_PROXY`, then `http_proxy`, when set; Qt only reads `http_proxy`, and only on Linux. No `no_proxy`.
-- Chunk queue: split the file into 4 MB chunks (1 MB on slow lines) and keep the connections busy taking the next chunk, so one slow connection no longer drags the end. Check first whether Qt 6's HTTP/2 puts all connections on one TCP connection.
+- Manual proxy with an empty host fails requests with a bare "unknown error"; refuse to start with "Manual proxy needs a host" instead.
 - "Remove download" applies only when extracting. Decide the Windows EXE case (hide it, or keep it for the installer) during the Windows work; for now it stays enabled there once the installer runs.
 
 ## Scope
@@ -71,7 +70,8 @@ Rules:
 - Stream into a partial file. Handle timeouts, bounded retries, cancellation, HTTP errors, truncation, and unknown length.
 - A file becomes reusable cache only after validation.
 - SHA-256 is for diagnostics and cache bookkeeping, not proof of authenticity. Do not invent published checksums.
-- Proxy modes: system, direct, manual. Verify real system-proxy behaviour per OS. No stored proxy passwords; authenticated proxies are deferred.
+- Proxy modes: system, direct, manual. System mode honours `https_proxy`/`HTTPS_PROXY`, `http_proxy`/`HTTP_PROXY`, `all_proxy`/`ALL_PROXY` (first set wins; `http://` or `socks5://` with a scheme, no `no_proxy`) before Qt's native settings. No stored proxy passwords; authenticated proxies are rejected with a message and deferred.
+- Downloads run as a queue of 4 MiB chunks (1 MiB after a slow chunk) over up to 8 connections; HTTP/2 is disabled per request so Qt 6 does not multiplex them onto one TCP connection, and `Accept-Encoding: identity` keeps ranges byte-exact.
 
 ## Installation
 
