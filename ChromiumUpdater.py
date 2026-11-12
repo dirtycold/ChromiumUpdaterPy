@@ -3,15 +3,21 @@
 import base64
 import hashlib
 import os
+import shutil
+import stat
 import sys
-from enum import Enum
-from pathlib import Path
+import zipfile
+from enum           import  Enum
+from pathlib        import  Path
 
-from qtpy.QtCore    import  QDir, QElapsedTimer, QEvent, QFile, QFileInfo, QIODevice, QObject, QSettings, \
-                            QStandardPaths, QSysInfo, QThread, QTimer, QUrl, Qt, Signal, Slot
+from qtpy.QtCore    import (QDir, QElapsedTimer, QEvent, QFile, QFileInfo, 
+                            QIODevice, QObject, QSettings, QStandardPaths, 
+                            QSysInfo, QThread, QTimer, QUrl, Qt, Signal, Slot,
+                            )
 from qtpy.QtGui     import  QIcon
-from qtpy.QtNetwork import  QNetworkAccessManager, QNetworkProxy, QNetworkProxyFactory, \
-                            QNetworkReply, QNetworkRequest
+from qtpy.QtNetwork import (QNetworkAccessManager, QNetworkProxy, 
+                            QNetworkProxyFactory, QNetworkReply, QNetworkRequest,
+                            )
 from qtpy.QtWidgets import (QApplication, QCheckBox, QComboBox, QFileDialog, 
                             QFormLayout, QGroupBox, QHBoxLayout, QLabel, 
                             QLayout, QLineEdit, QProgressBar, QPushButton, 
@@ -146,7 +152,7 @@ class Settings:
         self.setting.setValue(option.value, type(self.defaults[option])(value))
 
 
-class Downloader(QObject):
+class Updater(QObject):
     """Lives in its own thread; everything crossing over goes through a signal."""
     SERVER = "https://storage.googleapis.com/chromium-browser-snapshots"
     # Milliseconds between progress reports
@@ -173,10 +179,16 @@ class Downloader(QObject):
         FAILED    = 1
         CANCELLED = 2
 
-    checked = Signal(str, str, int)
-    progress = Signal(int, int)
-    # A Result, and the reason when it failed
-    finished = Signal(object, str)
+    class Stage(Enum):
+        IDLE        = 0
+        CHECKING    = 1
+        DOWNLOADING = 2
+        EXTRACTING  = 3
+
+    # A pulse: the report has changed; read it for the details
+    changed = Signal()
+    # A Result alone; the report has the details
+    finished = Signal(object)
 
     def __init__(self):
         super().__init__()
@@ -185,6 +197,8 @@ class Downloader(QObject):
         self.replies = []
         self.cancelled = False
         self.error = ""
+        # One snapshot, always rebuilt whole and rebound, so any thread reads it consistently
+        self.report = self.snapshot(self.Stage.IDLE, "", "", 0)
 
     def request(self, url):
         request = QNetworkRequest(QUrl(url))
@@ -193,7 +207,6 @@ class Downloader(QObject):
         request.setRawHeader(b"Accept-Encoding", b"identity")
         return request
 
-    @Slot(str, str, int)
     def proxy(self, mode, host, port):
         self.error = ""
         proxy = {
@@ -217,30 +230,58 @@ class Downloader(QObject):
                     proxy = QNetworkProxy(kind, url.host(), port)
         self.manager.setProxy(proxy)
 
-    @Slot(str, str)
-    def check(self, folder, file):
+    @staticmethod
+    def snapshot(stage, folder, file, revision):
+        return {"stage": stage, "folder": folder, "file": file, "revision": revision,
+                "received": 0, "total": 0, "speed": 0, "error": ""}
+
+    def publish(self, **changes):
+        self.report = {**self.report, **changes}
+        self.changed.emit()
+
+    @Slot(str, str, tuple)
+    def check(self, folder, file, options):
+        self.proxy(*options[:3])
         if self.error:
-            self.finished.emit(self.Result.FAILED, self.error)
+            self.report = {**self.report, "folder": folder, "file": file, "error": self.error}
+            self.finished.emit(self.Result.FAILED)
             return
+        self.report = self.snapshot(self.Stage.CHECKING, folder, file, 0)
+        self.changed.emit()
         reply = self.manager.get(self.request(f"{self.SERVER}/{folder}/LAST_CHANGE"))
 
         def finished():
             reply.deleteLater()
             text = bytes(reply.readAll()).decode("ascii", "replace").strip()
+            # A reply that outlived its target or operation changes nothing
+            report = self.report
+            if (report["stage"], report["folder"], report["file"]) != (self.Stage.CHECKING, folder, file):
+                return
             if reply.error() != QNetworkReply.NetworkError.NoError:
-                self.finished.emit(self.Result.FAILED, f"Check failed: {reply.errorString()}")
+                self.report = {**report, "error": f"Check failed: {reply.errorString()}"}
+                self.finished.emit(self.Result.FAILED)
             elif not text.isdigit() or int(text) <= 0:
-                self.finished.emit(self.Result.FAILED, "Check failed: unexpected revision reply")
+                self.report = {**report, "error": "Check failed: unexpected revision reply"}
+                self.finished.emit(self.Result.FAILED)
             else:
-                self.checked.emit(folder, file, int(text))
+                self.report = {**report, "revision": int(text)}
+                self.finished.emit(self.Result.DONE)
         reply.finished.connect(finished)
 
-    @Slot(str, str, int)
-    def download(self, url, path, segments):
-        """Fetches url into path in parallel ranges, through path.part."""
-        if self.error:
-            self.finished.emit(self.Result.FAILED, self.error)
+    @Slot(bool, tuple)
+    def download(self, extract, options):
+        """Fetches the checked revision's file in parallel ranges, through a .part file."""
+        mode, host, port, directory, segments = options
+        self.proxy(mode, host, port)
+        folder, file, revision = self.report["folder"], self.report["file"], self.report["revision"]
+        if self.error or not revision:
+            self.report = {**self.report, "error": self.error or "Check for updates first"}
+            self.finished.emit(self.Result.FAILED)
             return
+        self.report = self.snapshot(self.Stage.DOWNLOADING, folder, file, revision)
+        self.changed.emit()
+        url = f"{self.SERVER}/{folder}/{revision}/{file}"
+        path = f"{directory}/{folder}/{revision}/{file}"
         part = QFile(path + ".part")
         self.cancelled = False
         size, md5, step, received = 0, "", 4 << 20, []
@@ -248,8 +289,10 @@ class Downloader(QObject):
         offset = 0
         stopped = False
         ranged, left = False, 0
+        # One clock serves the progress throttle and the average speed
         clock = QElapsedTimer()
         clock.start()
+        last = 0
 
         def fail(message):
             nonlocal stopped
@@ -262,10 +305,9 @@ class Downloader(QObject):
                 reply.abort()
             part.close()
             part.remove()
-            if self.cancelled:
-                self.finished.emit(self.Result.CANCELLED, "")
-            else:
-                self.finished.emit(self.Result.FAILED, f"Download failed: {message}")
+            if not self.cancelled:
+                self.report = {**self.report, "error": f"Download failed: {message}"}
+            self.finished.emit(self.Result.CANCELLED if self.cancelled else self.Result.FAILED)
 
         def intact(name):
             """Whether name has the server's size and MD5."""
@@ -281,6 +323,7 @@ class Downloader(QObject):
             return base64.b64encode(digest.digest()).decode() == md5
 
         def write(reply, index):
+            nonlocal last
             if reply in self.replies:
                 start, end = ranges[index]
                 status = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
@@ -303,9 +346,11 @@ class Downloader(QObject):
                     return
                 received[index] += len(data)
                 # Every chunk would flood the window with updates
-                if clock.elapsed() > self.INTERVAL:
-                    clock.restart()
-                    self.progress.emit(sum(received), size)
+                if clock.elapsed() - last > self.INTERVAL:
+                    last = clock.elapsed()
+                    done = sum(received)
+                    # The speed is the average since the download started
+                    self.publish(received=done, total=size, speed=done * 1000 // max(last, 1))
 
         def fetch(index):
             """Requests what is left of segment index."""
@@ -344,7 +389,9 @@ class Downloader(QObject):
             nonlocal left, step, stopped
             reply.deleteLater()
             status = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
-            write(reply, index)
+            # Drain what a cleanly closed reply still buffers; an aborted one is not readable
+            if reply.error() == QNetworkReply.NetworkError.NoError:
+                write(reply, index)
             if reply not in self.replies:
                 return
             self.replies.remove(reply)
@@ -377,8 +424,8 @@ class Downloader(QObject):
                     fail(part.errorString())
                 else:
                     stopped = True
-                    self.progress.emit(size, size)
-                    self.finished.emit(self.Result.DONE, "")
+                    self.publish(received=size, total=size)
+                    self.complete(path, extract)
 
         def describe():
             head = self.manager.head(self.request(url))
@@ -412,8 +459,8 @@ class Downloader(QObject):
                 fail("the server did not report a checksum")
             elif intact(path):
                 stopped = True
-                self.progress.emit(size, size)
-                self.finished.emit(self.Result.DONE, "")
+                self.publish(received=size, total=size)
+                self.complete(path, extract)
             elif not QDir().mkpath(path.rsplit("/", 1)[0]) or not part.open(
                     QIODevice.OpenModeFlag.ReadWrite | QIODevice.OpenModeFlag.Truncate) or not part.resize(size):
                 fail(part.errorString())
@@ -421,6 +468,83 @@ class Downloader(QObject):
                 for _ in range(count):
                     fetch(len(ranges))
         describe()
+
+    def extract(self, archive, destination):
+        """Unpacks archive into destination, keeping symlinks and permissions."""
+        self.publish(stage=self.Stage.EXTRACTING, received=0, total=0, speed=0)
+        clock = QElapsedTimer()
+        clock.start()
+        base = Path(destination).resolve()
+        roots = set()
+
+        def abort(message):
+            for root in roots:
+                shutil.rmtree(base / root, ignore_errors=True)
+            if not self.cancelled:
+                self.report = {**self.report, "error": f"Extraction failed: {message}"}
+            self.finished.emit(self.Result.CANCELLED if self.cancelled else self.Result.FAILED)
+
+        try:
+            with zipfile.ZipFile(archive) as source:
+                entries = source.infolist()
+                total = sum(entry.file_size for entry in entries)
+                done = 0
+                # A previous run may have left a stale or partial tree
+                roots.update(entry.filename.split("/", 1)[0] for entry in entries)
+                roots.discard("")
+                for root in sorted(roots):
+                    spot = base / root
+                    if spot.is_dir() and not spot.is_symlink():
+                        shutil.rmtree(spot)
+                    elif spot.exists() or spot.is_symlink():
+                        spot.unlink()
+                for entry in entries:
+                    if self.cancelled:
+                        abort("")
+                        return
+                    target = base / entry.filename
+                    # Nothing may land outside the destination, through dots or a planted link
+                    if not target.resolve().is_relative_to(base):
+                        abort(f"unsafe path in the archive: {entry.filename}")
+                        return
+                    if entry.is_dir():
+                        target.mkdir(parents=True, exist_ok=True)
+                        continue
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    mode = entry.external_attr >> 16
+                    if stat.S_ISLNK(mode):
+                        where = source.read(entry).decode("utf-8", "replace")
+                        if Path(where).is_absolute() or not (
+                                target.parent / where).resolve().is_relative_to(base):
+                            abort(f"unsafe link in the archive: {entry.filename}")
+                            return
+                        target.unlink(missing_ok=True)
+                        os.symlink(where, target)
+                        done += entry.file_size
+                        continue
+                    with source.open(entry) as data, open(target, "wb") as file:
+                        while chunk := data.read(1 << 20):
+                            if self.cancelled:
+                                abort("")
+                                return
+                            file.write(chunk)
+                            done += len(chunk)
+                            if clock.elapsed() > self.INTERVAL:
+                                clock.restart()
+                                self.publish(received=done, total=total)
+                    if mode:
+                        os.chmod(target, mode & 0o777)
+            self.publish(received=total, total=total)
+            self.finished.emit(self.Result.DONE)
+        except (OSError, ValueError, RuntimeError, zipfile.BadZipFile) as error:
+            abort(str(error))
+
+    def complete(self, path, extract):
+        """Ends the download stage: extraction when asked, otherwise done."""
+        if extract:
+            self.extract(path, path.rsplit("/", 1)[0])
+        else:
+            self.finished.emit(self.Result.DONE)
 
     @Slot()
     def cancel(self):
@@ -430,11 +554,9 @@ class Downloader(QObject):
         if self.replies:
             self.replies[0].abort()
 
-
 class Window(QWidget):
-    proxied = Signal(str, str, int)
-    requested = Signal(str, str)
-    ordered = Signal(str, str, int)
+    queried = Signal(str, str, tuple)
+    requested = Signal(bool, tuple)
     aborted = Signal()
 
     def __init__(self, parent=None):
@@ -445,7 +567,6 @@ class Window(QWidget):
         self.settings = Settings(self.platform)
         self.remote = None
         self.url = ""
-        self.revision = 0
         self.active = False
 
         self.status = QLabel("Ready")
@@ -490,16 +611,14 @@ class Window(QWidget):
         settingsButton.toggled.connect(self.settingsPanel.setVisible)
         self.apply()
 
-        self.downloader = Downloader()
+        self.updater = Updater()
         self.worker = QThread(self)
-        self.downloader.moveToThread(self.worker)
-        self.proxied.connect(self.downloader.proxy)
-        self.requested.connect(self.downloader.check)
-        self.ordered.connect(self.downloader.download)
-        self.aborted.connect(self.downloader.cancel)
-        self.downloader.checked.connect(self.checked)
-        self.downloader.progress.connect(self.progressed)
-        self.downloader.finished.connect(self.finished)
+        self.updater.moveToThread(self.worker)
+        self.queried.connect(self.updater.check)
+        self.requested.connect(self.updater.download)
+        self.aborted.connect(self.updater.cancel)
+        self.updater.changed.connect(self.changed)
+        self.updater.finished.connect(self.finished)
         self.worker.start()
         self.checkButton.clicked.connect(self.check)
         if self.settings.get(Settings.Option.CHECK):
@@ -695,6 +814,7 @@ class Window(QWidget):
         extract = native and not exe and self.extractCheck.isChecked()
         install = (exe or (extract and not portable)) and self.installCheck.isChecked()
         manual = self.proxyMode.currentData() == Proxy.Mode.MANUAL.name
+        self.extractable = extract
         self.platformBox.setVisible(native)
         if system == "windows":
             self.exeSection.setVisible(exe)
@@ -741,54 +861,57 @@ class Window(QWidget):
         if not folder:
             self.status.setText("No snapshot for this target")
             return
-        self.status.setText("Checking…")
-        self.progress.setRange(0, 0)
-        self.proxied.emit(self.proxyMode.currentData(), self.proxyHost.text().strip(), self.proxyPort.value())
-        self.requested.emit(folder, file)
+        self.queried.emit(folder, file, self.options())
 
-    def checked(self, folder, file, revision):
-        if (folder, file) != self.remote:
-            return
-        self.revision = revision
-        self.url = f"{Downloader.SERVER}/{folder}/{revision}/{file}"
-        self.urlButton.setEnabled(True)
-        self.actionButton.setEnabled(True)
-        self.progress.setRange(0, 100)
-        self.status.setText(f"Revision {revision} is available")
+    def changed(self):
+        report = self.updater.report
+        self.progress.setRange(0, report["total"])
+        self.progress.setValue(report["received"])
+        text = {Updater.Stage.CHECKING: "Checking…", Updater.Stage.DOWNLOADING: "Downloading…",
+                Updater.Stage.EXTRACTING: "Extracting…"}.get(report["stage"], "")
+        if report["total"]:
+            text += f" {report['received'] >> 20} of {report['total'] >> 20} MB"
+        if speed := report["speed"]:
+            rate = f"{speed / (1 << 20):.1f} MB/s" if speed >= 1 << 20 else f"{speed >> 10} KB/s"
+            text += f" · {rate}"
+        self.status.setText(text)
 
     def act(self):
         if self.active:
+            # A queued cancel cannot reach the busy extraction loop
+            self.updater.cancelled = True
             self.aborted.emit()
             return
-        folder, file = self.remote
         self.work(True)
-        self.status.setText("Downloading…")
-        self.progress.setRange(0, 0)
-        self.proxied.emit(self.proxyMode.currentData(), self.proxyHost.text().strip(), self.proxyPort.value())
-        self.ordered.emit(
-            self.url, f"{self.settings.get(Settings.Option.DOWNLOADDIR)}/{folder}/{self.revision}/{file}",
-            self.settings.get(Settings.Option.SEGMENTS))
-        self.clock = QElapsedTimer()
-        self.clock.start()
+        self.requested.emit(self.extractable, self.options())
 
-    def progressed(self, received, total):
-        self.progress.setRange(0, total)
-        self.progress.setValue(received)
-        # Average since the download started
-        speed = received * 1000 // max(self.clock.elapsed(), 1)
-        rate = f"{speed / (1 << 20):.1f} MB/s" if speed >= 1 << 20 else f"{speed >> 10} KB/s"
-        self.status.setText(f"Downloading… {received >> 20} of {total >> 20} MB · {rate}")
+    def options(self):
+        """The settings a network operation needs: proxy mode, host, port, folder, connections."""
+        return (self.proxyMode.currentData(), self.proxyHost.text().strip(), self.proxyPort.value(),
+                self.settings.get(Settings.Option.DOWNLOADDIR), self.settings.get(Settings.Option.SEGMENTS))
 
-    def finished(self, result, message):
-        self.work(False)
-        if result == Downloader.Result.DONE:
-            self.status.setText(f"Downloaded revision {self.revision}")
+    def finished(self, result):
+        report = self.updater.report
+        if (report["folder"], report["file"]) != self.remote:
             return
-        self.progress.setRange(0, 100)
-        self.progress.reset()
-        self.status.setText("Cancelled" if result == Downloader.Result.CANCELLED else message)
+        self.work(False)
+        if result != Updater.Result.DONE:
+            self.progress.setRange(0, 100)
+            self.progress.reset()
+            self.status.setText("Cancelled" if result == Updater.Result.CANCELLED else report["error"])
+        elif report["stage"] == Updater.Stage.CHECKING:
+            self.url = f"{Updater.SERVER}/{report['folder']}/{report['revision']}/{report['file']}"
+            self.urlButton.setEnabled(True)
+            self.actionButton.setEnabled(True)
+            self.progress.setRange(0, 100)
+            self.status.setText(f"Revision {report['revision']} is available")
+        else:
+            done = "Extracted" if report["stage"] == Updater.Stage.EXTRACTING else "Downloaded"
+            self.status.setText(f"{done} revision {report['revision']}")
 
     def closeEvent(self, event):
+        # Extraction loops inside its slot and only a direct flag reaches it
+        self.updater.cancelled = True
         self.worker.quit()
         self.worker.wait()
         super().closeEvent(event)
