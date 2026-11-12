@@ -187,6 +187,8 @@ class Downloader(QObject):
     def request(self, url):
         request = QNetworkRequest(QUrl(url))
         request.setTransferTimeout(self.TIMEOUT)
+        request.setAttribute(QNetworkRequest.Attribute.Http2AllowedAttribute, False)
+        request.setRawHeader(b"Accept-Encoding", b"identity")
         return request
 
     @Slot(str, str, int)
@@ -216,12 +218,19 @@ class Downloader(QObject):
         """Fetches url into path in parallel ranges, through path.part."""
         part = QFile(path + ".part")
         self.cancelled = False
-        size, md5, step, received = 0, "", 0, []
+        size, md5, step, received = 0, "", 4 << 20, []
+        ranges = []
+        offset = 0
+        stopped = False
         ranged, left = False, 0
         clock = QElapsedTimer()
         clock.start()
 
         def fail(message):
+            nonlocal stopped
+            if stopped:
+                return
+            stopped = True
             # Aborting a reply finishes it with an error; it is no longer listed by then
             replies, self.replies = self.replies, []
             for reply in replies:
@@ -248,8 +257,21 @@ class Downloader(QObject):
 
         def write(reply, index):
             if reply in self.replies:
+                start, end = ranges[index]
+                status = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
+                if status != (206 if ranged else 200):
+                    return
+                if ranged and bytes(reply.rawHeader(b"Content-Range")) != (
+                        f"bytes {reply.property('start')}-{end - 1}/{size}".encode()):
+                    fail("unexpected Content-Range")
+                    return
                 data = reply.readAll()
-                part.seek(index * step + received[index])
+                if len(data) > end - start - received[index]:
+                    fail("the server sent more data than requested")
+                    return
+                if not part.seek(start + received[index]):
+                    fail(part.errorString())
+                    return
                 # The file is full size from the start, so a short write would go unnoticed later
                 if part.write(data) != len(data):
                     fail(part.errorString())
@@ -262,39 +284,65 @@ class Downloader(QObject):
 
         def fetch(index):
             """Requests what is left of segment index."""
+            nonlocal offset, left
+            if index == len(ranges):
+                if offset >= size:
+                    return
+                end = min(size, offset + step) if ranged else size
+                ranges.append((offset, end))
+                received.append(0)
+                offset = end
+                left += 1
+            start, end = ranges[index]
             request = self.request(url)
             if ranged:
                 request.setRawHeader(
-                    b"Range", f"bytes={index * step + received[index]}-{min(size, (index + 1) * step) - 1}".encode())
+                    b"Range", f"bytes={start + received[index]}-{end - 1}".encode())
             reply = self.manager.get(request)
+            reply.setProperty("start", start + received[index])
+            timer = QElapsedTimer()
+            timer.start()
             reply.readyRead.connect(lambda: write(reply, index))
-            reply.finished.connect(lambda: finished(reply, index))
+            reply.finished.connect(lambda: finished(reply, index, timer.elapsed()))
             self.replies.append(reply)
 
         def retry(index):
             # The download may have failed or been cancelled meanwhile
-            if not part.isOpen():
+            if stopped or not part.isOpen():
                 return
             if self.cancelled:
                 fail("")
             else:
                 fetch(index)
 
-        def finished(reply, index):
-            nonlocal left
+        def finished(reply, index, elapsed):
+            nonlocal left, step, stopped
             reply.deleteLater()
             status = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
+            write(reply, index)
             if reply not in self.replies:
                 return
             self.replies.remove(reply)
-            if not self.cancelled and ranged and reply.error() in self.RETRIABLE:
+            start, end = ranges[index]
+            complete = received[index] == end - start
+            if self.cancelled:
+                fail("")
+            elif ranged and not complete and (reply.error() in self.RETRIABLE or (
+                    reply.error() == QNetworkReply.NetworkError.NoError and status == 206)):
                 QTimer.singleShot(self.DELAY, lambda: retry(index))
             elif reply.error() != QNetworkReply.NetworkError.NoError:
                 fail(reply.errorString())
             elif status != (206 if ranged else 200):
                 fail(f"unexpected HTTP status {status}")
+            elif not complete:
+                fail("the file is incomplete")
             else:
                 left -= 1
+                if ranged:
+                    transferred = end - reply.property("start")
+                    step = (1 if transferred * 1000 < (1 << 20) * max(elapsed, 1) else 4) << 20
+                if offset < size:
+                    fetch(len(ranges))
                 if left:
                     return
                 part.close()
@@ -303,6 +351,7 @@ class Downloader(QObject):
                 elif (QFile.exists(path) and not QFile.remove(path)) or not part.rename(path):
                     fail(part.errorString())
                 else:
+                    stopped = True
                     self.progress.emit(size, size)
                     self.finished.emit(self.Result.DONE, "")
 
@@ -312,21 +361,22 @@ class Downloader(QObject):
             head.finished.connect(lambda: described(head))
 
         def redescribe():
+            if stopped:
+                return
             if self.cancelled:
                 fail("")
             else:
                 describe()
 
         def described(head):
-            nonlocal size, md5, step, ranged, left
+            nonlocal size, md5, ranged, stopped
             head.deleteLater()
             self.replies = []
             size = head.header(QNetworkRequest.KnownHeaders.ContentLengthHeader) or 0
             hashes = bytes(head.rawHeader(b"x-goog-hash")).decode("ascii", "replace")
             md5 = next((each.strip()[4:] for each in hashes.split(",") if each.strip().startswith("md5=")), "")
             ranged = bytes(head.rawHeader(b"accept-ranges")) == b"bytes"
-            count = segments if ranged else 1
-            step = -(-size // count)
+            count = max(1, min(segments, 8)) if ranged else 1
             if not self.cancelled and head.error() in self.RETRIABLE:
                 QTimer.singleShot(self.DELAY, redescribe)
             elif head.error() != QNetworkReply.NetworkError.NoError:
@@ -336,16 +386,15 @@ class Downloader(QObject):
             elif not md5:
                 fail("the server did not report a checksum")
             elif intact(path):
+                stopped = True
                 self.progress.emit(size, size)
                 self.finished.emit(self.Result.DONE, "")
             elif not QDir().mkpath(path.rsplit("/", 1)[0]) or not part.open(
                     QIODevice.OpenModeFlag.ReadWrite | QIODevice.OpenModeFlag.Truncate) or not part.resize(size):
                 fail(part.errorString())
             else:
-                received.extend([0] * count)
-                left = count
-                for index in range(count):
-                    fetch(index)
+                for _ in range(count):
+                    fetch(len(ranges))
         describe()
 
     @Slot()
