@@ -3,7 +3,10 @@
 import base64
 import hashlib
 import os
+import plistlib
+import re
 import stat
+import subprocess
 import sys
 import tempfile
 import zipfile
@@ -11,7 +14,7 @@ from enum           import  Enum
 from pathlib        import  Path
 
 from qtpy.QtCore    import (QDir, QElapsedTimer, QEvent, QFile, QFileInfo, 
-                            QIODevice, QObject, QSettings, QStandardPaths, 
+                            QIODevice, QLockFile, QObject, QSaveFile, QSettings, QStandardPaths, QStorageInfo,
                             QSysInfo, QThread, QTimer, QUrl, Qt, Signal, Slot,
                             )
 from qtpy.QtGui     import  QIcon
@@ -31,6 +34,12 @@ def resource(name):
 
 
 class Platform:
+    class File:
+        MAC         = "chrome-mac.zip"
+        WINDOWS     = "chrome-win.zip"
+        LINUX       = "chrome-linux.zip"
+        INSTALLER   = "mini_installer.exe"
+
     class Directory(Enum):
         DOWNLOAD = 0
         INSTALL  = 1
@@ -42,9 +51,9 @@ class Platform:
     def __init__(self):
         self.os = {"darwin": "macos", "win32": "windows", "linux": "linux"}.get(sys.platform, "")
         self.arch = {
-            "arm64": "arm64", "aarch64": "arm64",
-            "x86_64": "x64", "amd64": "x64",
-            "i386": "x86", "i686": "x86", "x86": "x86",
+            "arm64":    "arm64",
+            "x86_64":   "x64",
+            "i386":     "x86",
         }.get(QSysInfo.currentCpuArchitecture().lower(), "")
 
     @staticmethod
@@ -80,6 +89,15 @@ class Platform:
             "linux":    QStandardPaths.writableLocation(QStandardPaths.HomeLocation) + "/.local/opt/chromium",
         }.get(self.os, "")
 
+    def payload(self):
+        # Snapshot archive layouts and executable names:
+        # https://chromium.googlesource.com/chromium/src/+/131.0.6768.0/tools/bisect-builds.py
+        return {
+            "macos":    ("chrome-mac/Chromium.app", "Contents/MacOS/Chromium"),
+            "windows":  ("chrome-win", "chrome.exe"),
+            "linux":    ("chrome-linux", "chrome"),
+        }.get(self.os, ("", ""))
+
     @staticmethod
     def remote(target, package):
         """Snapshot folder and file name on the server; no folder when there is no snapshot."""
@@ -92,8 +110,8 @@ class Platform:
             "linux-x64":        "Linux_x64",
         }.get(target, "")
         if target.startswith("windows"):
-            return folder, "mini_installer.exe" if package == Platform.Package.EXE.name else "chrome-win.zip"
-        return folder, "chrome-mac.zip" if target.startswith("macos") else "chrome-linux.zip"
+            return folder, Platform.File.INSTALLER if package == Platform.Package.EXE.name else Platform.File.WINDOWS
+        return folder, Platform.File.MAC if target.startswith("macos") else Platform.File.LINUX
 
 
 class Proxy:
@@ -107,7 +125,6 @@ class Settings:
     class Option(Enum):
         PLATFORM    = "Platform"
         CHECK       = "Check"
-        EXTRACT     = "Extract"
         INSTALL     = "Install"
         CLEANUP     = "Cleanup"
         DOWNLOADDIR = "Directory/Download"
@@ -127,7 +144,6 @@ class Settings:
             self.Option.PLATFORM:       platform.current(),
             self.Option.CHECK:          False,
             self.Option.SEGMENTS:       4,
-            self.Option.EXTRACT:        platform.system() in {"macos", "windows"},
             self.Option.INSTALL:        platform.system() in {"macos", "windows"},
             self.Option.CLEANUP:        2,
             self.Option.DOWNLOADDIR:    platform.directory(Platform.Directory.DOWNLOAD),
@@ -184,6 +200,7 @@ class Updater(QObject):
         CHECKING    = 1
         DOWNLOADING = 2
         EXTRACTING  = 3
+        INSTALLING  = 4
 
     # A pulse: the report has changed; read it for the details
     changed = Signal()
@@ -197,6 +214,8 @@ class Updater(QObject):
         self.replies = []
         self.cancelled = False
         self.error = ""
+        self.platform = Platform()
+        self.log = []
         # One snapshot, always rebuilt whole and rebound, so any thread reads it consistently
         self.report = self.snapshot(self.Stage.IDLE, "", "", 0)
 
@@ -207,7 +226,8 @@ class Updater(QObject):
         request.setRawHeader(b"Accept-Encoding", b"identity")
         return request
 
-    def proxy(self, mode, host, port):
+    def proxy(self, proxy):
+        mode, host, port = proxy["mode"], proxy["host"], proxy["port"]
         self.error = ""
         proxy = {
             Proxy.Mode.DIRECT.name: QNetworkProxy(QNetworkProxy.ProxyType.NoProxy),
@@ -233,15 +253,15 @@ class Updater(QObject):
     @staticmethod
     def snapshot(stage, folder, file, revision):
         return {"stage": stage, "folder": folder, "file": file, "revision": revision,
-                "received": 0, "total": 0, "speed": 0, "error": ""}
+                "received": 0, "total": 0, "speed": 0, "error": "", "cancellable": True}
 
     def publish(self, **changes):
         self.report = {**self.report, **changes}
         self.changed.emit()
 
-    @Slot(str, str, tuple)
-    def check(self, folder, file, options):
-        self.proxy(*options[:3])
+    @Slot(str, str, dict)
+    def check(self, folder, file, proxy):
+        self.proxy(proxy)
         if self.error:
             self.report = {**self.report, "folder": folder, "file": file, "error": self.error}
             self.finished.emit(self.Result.FAILED)
@@ -268,12 +288,18 @@ class Updater(QObject):
                 self.finished.emit(self.Result.DONE)
         reply.finished.connect(finished)
 
-    @Slot(bool, tuple)
-    def download(self, extract, options):
+    @Slot(dict, dict)
+    def download(self, proxy, options):
         """Fetches the checked revision's file in parallel ranges, through a .part file."""
-        mode, host, port, directory, segments = options
-        self.proxy(mode, host, port)
+        directory, segments, install = options[Settings.Option.DOWNLOADDIR], options[Settings.Option.SEGMENTS], options[Settings.Option.INSTALL]
+        self.proxy(proxy)
         folder, file, revision = self.report["folder"], self.report["file"], self.report["revision"]
+        if install and not self.error:
+            native, _ = Platform.remote(self.platform.current(), Platform.Package.EXE.name)
+            if folder != native or not native:
+                self.error = "Installation requires the native target"
+            elif self.platform.system() == "windows" and options[Settings.Option.WINDESKTOP] and file != Platform.File.INSTALLER:
+                self.error = "Desktop shortcut creation is not implemented yet"
         if self.error or not revision:
             self.report = {**self.report, "error": self.error or "Check for updates first"}
             self.finished.emit(self.Result.FAILED)
@@ -425,7 +451,7 @@ class Updater(QObject):
                 else:
                     stopped = True
                     self.publish(received=size, total=size)
-                    self.complete(path, extract)
+                    self.finished.emit(self.install(path, options) if install else self.Result.DONE)
 
         def describe():
             head = self.manager.head(self.request(url))
@@ -460,7 +486,7 @@ class Updater(QObject):
             elif intact(path):
                 stopped = True
                 self.publish(received=size, total=size)
-                self.complete(path, extract)
+                self.finished.emit(self.install(path, options) if install else self.Result.DONE)
             elif not QDir().mkpath(path.rsplit("/", 1)[0]) or not part.open(
                     QIODevice.OpenModeFlag.ReadWrite | QIODevice.OpenModeFlag.Truncate) or not part.resize(size):
                 fail(part.errorString())
@@ -470,26 +496,13 @@ class Updater(QObject):
         describe()
 
     def extract(self, archive, destination):
-        """Unpacks archive into destination, keeping symlinks and permissions."""
+        """Unpacks into the caller's staging directory."""
         self.publish(stage=self.Stage.EXTRACTING, received=0, total=0, speed=0)
         clock = QElapsedTimer()
         clock.start()
-
-        def abort(message):
-            if not self.cancelled:
-                self.report = {**self.report, "error": f"Extraction failed: {message}"}
-            self.finished.emit(self.Result.CANCELLED if self.cancelled else self.Result.FAILED)
-
         try:
-            output = Path(destination).resolve() / "extracted"
-            # A previous run may have left a stale or partial tree
-            # Preserve existing output; only this run's staging directory is disposable
-            if output.exists() or output.is_symlink():
-                abort(f"output already exists: {output}")
-                return
-            with tempfile.TemporaryDirectory(prefix=".extract-", dir=destination) as staging, \
-                    zipfile.ZipFile(archive) as source:
-                base = Path(staging).resolve()
+            base = Path(destination).resolve()
+            with zipfile.ZipFile(archive) as source:
                 entries = source.infolist()
                 total = sum(entry.file_size for entry in entries)
                 done = 0
@@ -497,17 +510,16 @@ class Updater(QObject):
                 for entry in entries:
                     name = Path(entry.filename)
                     if name.is_absolute() or ".." in name.parts or not name.parts:
-                        abort(f"unsafe path in the archive: {entry.filename}")
-                        return
+                        self.error = f"Unsafe path in the archive: {entry.filename}"
+                        return False
                 for entry in entries:
                     if self.cancelled:
-                        abort("")
-                        return
+                        return False
                     target = base / entry.filename
                     # Nothing may land outside the destination, through dots or a planted link
                     if not target.resolve().is_relative_to(base):
-                        abort(f"unsafe path in the archive: {entry.filename}")
-                        return
+                        self.error = f"Unsafe path in the archive: {entry.filename}"
+                        return False
                     if entry.is_dir():
                         target.mkdir(parents=True, exist_ok=True)
                         directories.append((target, entry.external_attr >> 16))
@@ -518,8 +530,8 @@ class Updater(QObject):
                         where = source.read(entry).decode("utf-8")
                         if Path(where).is_absolute() or not (
                                 target.parent / where).resolve().is_relative_to(base):
-                            abort(f"unsafe link in the archive: {entry.filename}")
-                            return
+                            self.error = f"Unsafe link in the archive: {entry.filename}"
+                            return False
                         target.unlink(missing_ok=True)
                         os.symlink(where, target)
                         done += entry.file_size
@@ -534,31 +546,175 @@ class Updater(QObject):
                                 clock.restart()
                                 self.publish(received=done, total=total)
                     if self.cancelled:
-                        abort("")
-                        return
+                        return False
                     if mode:
                         os.chmod(target, mode & 0o777)
                 for directory, mode in sorted(directories, key=lambda item: len(item[0].parts), reverse=True):
                     if mode:
                         os.chmod(directory, mode & 0o777)
                 if self.cancelled:
-                    abort("")
-                    return
-                if output.exists() or output.is_symlink():
-                    abort(f"output already exists: {output}")
-                    return
-                base.rename(output)
+                    return False
             self.publish(received=total, total=total)
-            self.finished.emit(self.Result.DONE)
+            return True
         except (OSError, ValueError, RuntimeError, zipfile.BadZipFile) as error:
-            abort(str(error))
+            self.error = f"Extraction failed: {error}"
+            return False
 
-    def complete(self, path, extract):
-        """Ends the download stage: extraction when asked, otherwise done."""
-        if extract:
-            self.extract(path, path.rsplit("/", 1)[0])
+    def command(self, arguments, accepted=(0,), timeout=60):
+        try:
+            result = subprocess.run(arguments, capture_output=True, text=True,
+                                    errors="replace", timeout=timeout)
+            output = result.stdout + result.stderr
+            self.log.append((arguments, output))
+            if result.returncode in accepted:
+                return result
+            self.error = f"{Path(arguments[0]).name} failed: {output.strip()}"
+        except (OSError, subprocess.SubprocessError) as error:
+            self.error = str(error)
+        return None
+
+    def idle(self, destination):
+        if self.platform.system() == "windows":
+            result = self.command(["tasklist", "/FI", "IMAGENAME eq chrome.exe", "/FO", "CSV", "/NH"])
+            running = result is not None and '"chrome.exe"' in result.stdout.lower()
         else:
-            self.finished.emit(self.Result.DONE)
+            _, executable = self.platform.payload()
+            result = self.command(["pgrep", "-f", re.escape(str(destination / executable))], (0, 1))
+            running = result is not None and result.returncode == 0
+        if running:
+            self.error = "Close Chromium before installing"
+        return result is not None and not running
+
+    def verify(self, application, prepare=False):
+        _, executable = self.platform.payload()
+        binary = application / executable
+        try:
+            if application.is_symlink() or not application.is_dir() or not binary.is_file():
+                self.error = "The archive does not contain the expected Chromium application"
+                return False
+            if self.platform.system() == "macos":
+                with open(application / "Contents/Info.plist", "rb") as file:
+                    info = plistlib.load(file)
+                if not isinstance(info, dict) or info.get("CFBundleIdentifier") != "org.chromium.Chromium":
+                    self.error = "Unexpected application bundle identifier"
+                    return False
+                if not prepare:
+                    return True
+                for item in [application, *application.rglob("*")]:
+                    if self.cancelled:
+                        return False
+                    attributes = self.command(["/usr/bin/xattr", "-s", str(item)])
+                    if attributes is None:
+                        return False
+                    if "com.apple.quarantine" in attributes.stdout.splitlines():
+                        if self.command(["/usr/bin/xattr", "-d", "-s", "com.apple.quarantine", str(item)]) is None:
+                            return False
+                arguments = ["/usr/bin/codesign", "--verify", "--strict", "--verbose=2", str(application)]
+                if self.command(arguments) is None:
+                    diagnostic = f"{application}: code has no resources but signature indicates they must be present"
+                    if not prepare or not self.log or self.log[-1][1].strip() != diagnostic:
+                        return False
+                    if self.command(["/usr/bin/codesign", "--force", "--sign", "-", str(application)]) is None:
+                        return False
+                    if self.command(arguments) is None:
+                        return False
+                    self.error = ""
+            return True
+        except (OSError, ValueError, plistlib.InvalidFileException) as error:
+            self.error = str(error)
+            return False
+
+    def install(self, archive, options):
+        """Installs a verified download; staging is always disposable."""
+        self.error = ""
+        self.publish(stage=self.Stage.INSTALLING, received=0, total=0, speed=0)
+        installer = Path(archive).name == Platform.File.INSTALLER
+        directory = (QStandardPaths.writableLocation(QStandardPaths.AppLocalDataLocation)
+                     if installer else options[Settings.Option.INSTALLDIR])
+        if not directory:
+            self.report = {**self.report, "error": "Choose an install folder"}
+            return self.Result.FAILED
+        lock = None
+        previous, target = None, None
+        moved, replaced, success = False, False, False
+        try:
+            destination = Path(directory).resolve()
+            destination.mkdir(parents=True, exist_ok=True)
+            lock = QLockFile(str(destination / ".chromium-updater.lock"))
+            lock.setStaleLockTime(0)
+            if not lock.tryLock(0):
+                self.error = "Another updater is using this install folder"
+                return self.Result.FAILED
+            relative, _ = self.platform.payload()
+            target = destination / Path(relative).name
+            if not self.idle(target):
+                return self.Result.FAILED
+            if self.cancelled:
+                return self.Result.CANCELLED
+            if installer:
+                self.publish(stage=self.Stage.INSTALLING, cancellable=False)
+                arguments = [str(Path(archive).resolve())]
+                if options[Settings.Option.WINSYSTEM]:
+                    arguments.append("--system-level")
+                return self.Result.DONE if self.command(arguments, timeout=None) is not None else self.Result.FAILED
+            previous = target.with_name(target.name + ".previous")
+            marker = destination / ("." + target.name + ".revision")
+            if target.is_symlink() or previous.is_symlink():
+                self.error = "The installation or backup is a symlink; choose another folder"
+                return self.Result.FAILED
+            if not target.exists() and previous.exists():
+                previous.rename(target)
+            if marker.exists() and int(marker.read_text().strip()) > self.report["revision"]:
+                self.error = "A newer Chromium revision is already installed"
+                return self.Result.FAILED
+            with zipfile.ZipFile(archive) as source:
+                required = sum(entry.file_size for entry in source.infolist())
+            if QStorageInfo(str(destination)).bytesAvailable() < required:
+                self.error = "Not enough free space to extract Chromium"
+                return self.Result.FAILED
+            with tempfile.TemporaryDirectory(prefix=".chromium-", dir=destination) as staging:
+                if not self.extract(archive, staging):
+                    return self.Result.CANCELLED if self.cancelled else self.Result.FAILED
+                application = Path(staging) / relative
+                if not self.verify(application, options[Settings.Option.MACSIGN]):
+                    return self.Result.CANCELLED if self.cancelled else self.Result.FAILED
+                if not self.idle(target):
+                    return self.Result.FAILED
+                if self.cancelled:
+                    return self.Result.CANCELLED
+                self.publish(stage=self.Stage.INSTALLING, received=0, total=0, cancellable=False)
+                if previous.exists() and not QDir(str(previous)).removeRecursively():
+                    self.error = "Could not remove the older backup"
+                    return self.Result.FAILED
+                if target.exists():
+                    target.rename(previous)
+                    moved = True
+                application.rename(target)
+                replaced = True
+                if not self.verify(target):
+                    return self.Result.FAILED
+                record = QSaveFile(str(marker))
+                revision = str(self.report["revision"]).encode()
+                if not record.open(QIODevice.WriteOnly) or record.write(revision) != len(revision) or not record.commit():
+                    self.error = "Could not record the installed revision"
+                    return self.Result.FAILED
+                success = True
+            return self.Result.DONE
+        except (OSError, ValueError, RuntimeError, zipfile.BadZipFile) as error:
+            self.error = f"Installation failed: {error}"
+            return self.Result.FAILED
+        finally:
+            if not success and (moved or replaced):
+                try:
+                    if replaced and not QDir(str(target)).removeRecursively():
+                        self.error += "; could not remove the failed installation"
+                    if moved:
+                        previous.rename(target)
+                except OSError as error:
+                    self.error += f"; restore {previous} manually: {error}"
+            if lock is not None:
+                lock.unlock()
+            self.report = {**self.report, "error": self.error, "cancellable": True}
 
     @Slot()
     def cancel(self):
@@ -569,8 +725,8 @@ class Updater(QObject):
             self.replies[0].abort()
 
 class Window(QWidget):
-    queried = Signal(str, str, tuple)
-    requested = Signal(bool, tuple)
+    queried = Signal(str, str, dict)
+    requested = Signal(dict, dict)
     aborted = Signal()
 
     def __init__(self, parent=None):
@@ -584,6 +740,8 @@ class Window(QWidget):
         self.active = False
 
         self.status = QLabel("Ready")
+        self.status.setTextInteractionFlags(Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
+        self.status.setWordWrap(True)
         self.badge = QLabel()
         self.badge.setToolTip("Selected download target")
         self.badge.setStyleSheet(
@@ -652,18 +810,16 @@ class Window(QWidget):
 
         autoCheck = QCheckBox("Check for updates on startup")
         autoCheck.setToolTip("Check the selected target when the updater opens; no automatic download or installation")
-        self.extractCheck = QCheckBox("Extract downloaded archive")
-        self.installCheck = QCheckBox("Install extracted Chromium")
+        self.installCheck = QCheckBox("Install Chromium")
         self.prepareCheck = QCheckBox("Prepare Chromium for macOS")
         self.prepareCheck.setToolTip(
             "Remove quarantine; repair only the outer app signature for the known resource error.")
         self.systemCheck = QCheckBox("Install system-wide for Windows")
         self.systemCheck.setToolTip("Windows EXE installer: --system-level; requires administrator approval")
         self.desktopCheck = QCheckBox("Create desktop shortcut for Windows")
-        self.desktopCheck.setToolTip("Windows ZIP extraction only")
+        self.desktopCheck.setToolTip("Windows ZIP installation only")
         for checkbox, option in (
                 (autoCheck, Settings.Option.CHECK),
-                (self.extractCheck, Settings.Option.EXTRACT),
                 (self.installCheck, Settings.Option.INSTALL),
                 (self.prepareCheck, Settings.Option.MACSIGN),
                 (self.systemCheck,  Settings.Option.WINSYSTEM),
@@ -692,7 +848,7 @@ class Window(QWidget):
         segments = QSpinBox()
         segments.setToolTip("Parallel connections for one download")
         cleanup = QSpinBox()
-        cleanup.setToolTip("Recent revisions kept per platform; 0 removes the download after successful extraction")
+        cleanup.setToolTip("Recent revisions kept per platform; 0 removes the download after successful installation")
         for spin, option, low, high in (
                 (self.proxyPort, Settings.Option.PROXYPORT, 1, 65535),
                 (segments, Settings.Option.SEGMENTS, 1, 8),
@@ -717,13 +873,13 @@ class Window(QWidget):
             ("Keep downloads", cleanup)))
         self.installDirectory = self.directory(Settings.Option.INSTALLDIR)
         if system == "windows":
-            self.exeSection = self.section(self.row(self.installCheck), self.row(self.systemCheck))
-            self.zipSection = self.section(self.row(self.extractCheck),
-                                           ("Install folder", self.installDirectory),
+            self.exeSection = self.section(self.row(self.systemCheck))
+            self.zipSection = self.section(("Install folder", self.installDirectory),
                                            self.row(self.desktopCheck))
-            sections = (self.section(("Package", self.packageCombo)), self.exeSection, self.zipSection)
+            sections = (self.section(("Package", self.packageCombo), self.row(self.installCheck)),
+                        self.exeSection, self.zipSection)
         else:
-            rows = [self.row(self.extractCheck), self.row(self.installCheck),
+            rows = [self.row(self.installCheck),
                     ("Install folder", self.installDirectory)]
             if system == "macos":
                 rows.append(self.row(self.prepareCheck))
@@ -825,31 +981,26 @@ class Window(QWidget):
         macos = native and system == "macos"
         exe = windows and self.packageCombo.currentData() == Platform.Package.EXE.name
         portable = windows and not exe
-        extract = native and not exe and self.extractCheck.isChecked()
-        install = (exe or (extract and not portable)) and self.installCheck.isChecked()
+        install = native and self.installCheck.isChecked()
         manual = self.proxyMode.currentData() == Proxy.Mode.MANUAL.name
-        self.extractable = extract
+        self.installable = install
         self.platformBox.setVisible(native)
         if system == "windows":
             self.exeSection.setVisible(exe)
             self.zipSection.setVisible(not exe)
         for widget, enabled in (
-                (self.extractCheck, not exe),
-                (self.installCheck, exe or (extract and not portable)),
-                (self.installDirectory, (install and not exe) or (portable and extract)),
-                (self.prepareCheck, extract and macos),
+                (self.installDirectory, install and not exe),
+                (self.prepareCheck, install and macos),
                 (self.systemCheck, install and exe),
-                (self.desktopCheck, portable and extract)):
+                (self.desktopCheck, install and portable)):
             widget.setEnabled(enabled)
             if widget in self.labels:
                 self.labels[widget].setEnabled(enabled)
         self.manualSection.setVisible(manual)
-        self.installCheck.setText("Run Chromium installer" if exe else "Install extracted Chromium")
+        self.installCheck.setText("Run Chromium installer" if exe else "Install Chromium")
 
         if install:
             action = "Download and Install"
-        elif extract:
-            action = "Download and Extract"
         else:
             action = "Download"
         self.actionButton.setText("Cancel" if self.active else action)
@@ -881,14 +1032,15 @@ class Window(QWidget):
         self.url = ""
         self.urlButton.setEnabled(False)
         self.actionButton.setEnabled(False)
-        self.queried.emit(folder, file, self.options())
+        self.queried.emit(folder, file, self.proxy())
 
     def changed(self):
         report = self.updater.report
         self.progress.setRange(0, report["total"])
         self.progress.setValue(report["received"])
         text = {Updater.Stage.CHECKING: "Checking…", Updater.Stage.DOWNLOADING: "Downloading…",
-                Updater.Stage.EXTRACTING: "Extracting…"}.get(report["stage"], "")
+                Updater.Stage.EXTRACTING: "Extracting…", Updater.Stage.INSTALLING: "Installing…"}.get(report["stage"], "")
+        self.actionButton.setEnabled(report["cancellable"] and report["stage"] != Updater.Stage.CHECKING)
         if report["total"]:
             text += f" {report['received'] >> 20} of {report['total'] >> 20} MB"
         if speed := report["speed"]:
@@ -903,18 +1055,26 @@ class Window(QWidget):
             self.aborted.emit()
             return
         self.work(True)
-        self.requested.emit(self.extractable, self.options())
+        self.requested.emit(self.proxy(), self.options())
+
+    def proxy(self):
+        return {"mode": self.proxyMode.currentData(),
+                "host": self.proxyHost.text().strip(), "port": self.proxyPort.value()}
 
     def options(self):
-        """The settings a network operation needs: proxy mode, host, port, folder, connections."""
-        return (self.proxyMode.currentData(), self.proxyHost.text().strip(), self.proxyPort.value(),
-                self.settings.get(Settings.Option.DOWNLOADDIR), self.settings.get(Settings.Option.SEGMENTS))
+        options = {option: self.settings.get(option) for option in (
+            Settings.Option.DOWNLOADDIR, Settings.Option.SEGMENTS, Settings.Option.INSTALL,
+            Settings.Option.INSTALLDIR, Settings.Option.MACSIGN,
+            Settings.Option.WINSYSTEM, Settings.Option.WINDESKTOP)}
+        options[Settings.Option.INSTALL] = self.installable
+        return options
 
     def finished(self, result):
         report = self.updater.report
         if (report["folder"], report["file"]) != self.remote:
             return
         self.work(False)
+        self.actionButton.setEnabled(bool(self.url))
         if result != Updater.Result.DONE:
             self.progress.setRange(0, 100)
             self.progress.reset()
@@ -926,10 +1086,13 @@ class Window(QWidget):
             self.progress.setRange(0, 100)
             self.status.setText(f"Revision {report['revision']} is available")
         else:
-            done = "Extracted" if report["stage"] == Updater.Stage.EXTRACTING else "Downloaded"
+            done = "Installed" if report["stage"] == Updater.Stage.INSTALLING else "Downloaded"
             self.status.setText(f"{done} revision {report['revision']}")
 
     def closeEvent(self, event):
+        if self.active and not self.updater.report["cancellable"]:
+            event.ignore()
+            return
         # Extraction loops inside its slot and only a direct flag reaches it
         self.updater.cancelled = True
         self.worker.quit()
