@@ -14,7 +14,7 @@ from enum           import  Enum
 from pathlib        import  Path
 
 from qtpy.QtCore    import (QDir, QElapsedTimer, QEvent, QFile, QFileInfo, 
-                            QIODevice, QLockFile, QObject, QSaveFile, QSettings, QStandardPaths, QStorageInfo,
+                            QIODevice, QLockFile, QObject, QSaveFile, QSettings, QSignalBlocker, QStandardPaths, QStorageInfo,
                             QSysInfo, QThread, QTimer, QUrl, Qt, Signal, Slot,
                             )
 from qtpy.QtGui     import  QDesktopServices, QIcon
@@ -852,9 +852,9 @@ class Window(QMainWindow):
         layout.setSizeConstraint(QLayout.SetNoConstraint)
         layout.addLayout(status)
         layout.addWidget(self.progress)
-        layout.addLayout(actions)
-        toolbar = QToolBar("Update controls", self)
+        self.toolbar = toolbar = QToolBar("Update controls", self)
         toolbar.setObjectName("updateControls")
+        toolbar.setContextMenuPolicy(Qt.PreventContextMenu)
         toolbar.setMovable(False)
         toolbar.setFloatable(False)
         toolbar.setAllowedAreas(Qt.TopToolBarArea)
@@ -863,11 +863,16 @@ class Window(QMainWindow):
         if sys.platform == "darwin":
             self.setUnifiedTitleAndToolBarOnMac(True)
 
+        central = QWidget()
+        centralLayout = QVBoxLayout(central)
+        centralLayout.setSizeConstraint(QLayout.SetNoConstraint)
+        centralLayout.addLayout(actions)
         self.settingsPanel = self.panel(self.checkButton)
-        self.setCentralWidget(self.settingsPanel)
-        self.settingsPanel.hide()
+        centralLayout.addWidget(self.settingsPanel)
+        self.setCentralWidget(central)
         settingsButton.toggled.connect(lambda visible: self.settingsPanel.setVisible(visible))
-        self.apply()
+        self.load()
+        self.settingsPanel.hide()
 
         self.updater = Updater()
         self.worker = QThread(self)
@@ -886,10 +891,8 @@ class Window(QMainWindow):
             QTimer.singleShot(0, self.check)
 
     def panel(self, checkButton):
-        target = self.settings.get(Settings.Option.PLATFORM)
+        self.settingWidgets = {}
         platforms = [("Auto", "")] + [(label, value) for value, label in Platform.supported().items()]
-        if target and target not in Platform.supported():
-            platforms.append((f"Unknown target: {target}", target))
         self.platformCombo = self.choice(Settings.Option.PLATFORM, platforms)
 
         self.packageCombo = self.choice(Settings.Option.WINPACKAGE, [
@@ -897,7 +900,7 @@ class Window(QMainWindow):
             ("ZIP archive", Platform.Package.ZIP.name),
         ])
 
-        autoCheck = QCheckBox("Check for updates on startup")
+        self.autoCheck = autoCheck = QCheckBox("Check for updates on startup")
         autoCheck.setToolTip("Check the selected target when the updater opens; no automatic download or installation")
         self.installCheck = QCheckBox("Install Chromium")
         self.prepareCheck = QCheckBox("Prepare Chromium for macOS")
@@ -918,13 +921,13 @@ class Window(QMainWindow):
                 (self.prepareCheck, Settings.Option.MACSIGN),
                 (self.systemCheck,  Settings.Option.WINSYSTEM),
                 (self.desktopCheck, desktopOption)):
-            checkbox.setChecked(self.settings.get(option))
+            self.settingWidgets[option] = checkbox
             checkbox.toggled.connect(lambda checked, key=option: (
                 self.settings.set(key, checked),
                 self.apply(),
             ))
 
-        refreshButton = QToolButton()
+        self.refreshButton = refreshButton = QToolButton()
         refreshButton.setIcon(self.style().standardIcon(QStyle.SP_BrowserReload))
         refreshButton.setToolTip("Check for updates now")
         refreshButton.setAccessibleName("Check for updates now")
@@ -939,7 +942,8 @@ class Window(QMainWindow):
 
         self.proxyMode = self.choice(Settings.Option.PROXYMODE,
                                      [(mode.name.title(), mode.name) for mode in Proxy.Mode])
-        self.proxyHost = QLineEdit(self.settings.get(Settings.Option.PROXYHOST))
+        self.proxyHost = QLineEdit()
+        self.settingWidgets[Settings.Option.PROXYHOST] = self.proxyHost
         self.proxyHost.setMinimumWidth(240)
         self.proxyHost.setPlaceholderText("proxy.example.com")
         self.proxyHost.setToolTip("Hostname only; authenticated proxies are not supported yet")
@@ -956,7 +960,7 @@ class Window(QMainWindow):
                 (cleanup, Settings.Option.CLEANUP, 0, 9)):
             spin.setRange(low, high)
             spin.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-            spin.setValue(self.settings.get(option))
+            self.settingWidgets[option] = spin
             spin.valueChanged.connect(lambda value, key=option: self.settings.set(key, value))
         # A one-digit box is too narrow; match the port's width
         for spin in (segments, cleanup):
@@ -998,11 +1002,10 @@ class Window(QMainWindow):
         width = max(label.sizeHint().width() for label in self.labels.values())
         for label in self.labels.values():
             label.setFixedWidth(width)
-        refreshButton.setVisible(autoCheck.isChecked())
-        checkButton.setVisible(not autoCheck.isChecked())
 
         settingsPanel = QWidget()
         layout = QVBoxLayout(settingsPanel)
+        layout.setContentsMargins(0, 0, 0, 0)
         for box in (general, self.platformBox, proxy):
             layout.addWidget(box)
         resetButton = QPushButton("Reset settings…")
@@ -1019,6 +1022,7 @@ class Window(QMainWindow):
             elif clock.elapsed() >= self.RESET * 1000:
                 timer.stop()
                 resetButton.setDown(False)
+                resetButton.setText("Reset settings…")
                 self.reset()
             else:
                 resetButton.setText(f"Reset in {self.RESET - clock.elapsed() // 1000}…")
@@ -1033,14 +1037,33 @@ class Window(QMainWindow):
         if self.active:
             return
         self.settings.setting.clear()
-        previous = self.settingsPanel
-        visible = previous.isVisible()
-        self.settingsPanel = self.panel(self.checkButton)
-        self.takeCentralWidget()
-        self.setCentralWidget(self.settingsPanel)
-        self.settingsPanel.setVisible(visible)
-        previous.hide()
-        previous.deleteLater()
+        self.load()
+
+    def load(self):
+        """Reload stored settings without saving intermediate control values."""
+        blockers = [QSignalBlocker(widget) for widget in self.settingWidgets.values()]
+        try:
+            target = self.settings.get(Settings.Option.PLATFORM)
+            supported = Platform.supported()
+            for index in reversed(range(self.platformCombo.count())):
+                value = self.platformCombo.itemData(index)
+                if value and value not in supported:
+                    self.platformCombo.removeItem(index)
+            if target and target not in supported:
+                self.platformCombo.addItem(f"Unknown target: {target}", target)
+            for option, widget in self.settingWidgets.items():
+                value = self.settings.get(option)
+                if isinstance(widget, QComboBox):
+                    index = widget.findData(value)
+                    widget.setCurrentIndex(index if index >= 0 else widget.findData(self.settings.defaults[option]))
+                elif isinstance(widget, QCheckBox):
+                    widget.setChecked(value)
+                elif isinstance(widget, QSpinBox):
+                    widget.setValue(value)
+                else:
+                    widget.setText(value)
+        finally:
+            blockers.clear()
         self.apply()
 
     @staticmethod
@@ -1073,19 +1096,31 @@ class Window(QMainWindow):
         combo.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         for label, value in items:
             combo.addItem(label, value)
-        index = combo.findData(self.settings.get(option))
-        combo.setCurrentIndex(index if index >= 0 else combo.findData(self.settings.defaults[option]))
+        self.settingWidgets[option] = combo
         combo.currentIndexChanged.connect(lambda: (
             self.settings.set(option, combo.currentData()),
             self.apply(),
         ))
         return combo
 
+    def fit(self):
+        height = self.layout().totalHeightForWidth(self.width())
+        height = height if height >= 0 else self.sizeHint().height()
+        self.setFixedHeight(height)
+        # Reassert the size even when the constraints have not changed.
+        if self.height() != height:
+            self.resize(self.width(), height)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # A Wayland startup configure can arrive after fixed-height sizing.
+        if self.minimumHeight() == self.maximumHeight() and self.height() != self.minimumHeight():
+            QTimer.singleShot(0, self.fit)
+
     def event(self, event):
         handled = super().event(event)
-        if event.type() == QEvent.LayoutRequest:
-            height = self.layout().totalHeightForWidth(self.width())
-            self.setFixedHeight(height if height >= 0 else self.sizeHint().height())
+        if event.type() == QEvent.LayoutRequest and hasattr(self, "settingsPanel"):
+            self.fit()
         return handled
 
     @staticmethod
@@ -1101,7 +1136,8 @@ class Window(QMainWindow):
 
     def directory(self, option):
         widget = QWidget()
-        edit = QLineEdit(self.settings.get(option))
+        edit = QLineEdit()
+        self.settingWidgets[option] = edit
         edit.setReadOnly(True)
         edit.setMinimumWidth(240)
         edit.textChanged.connect(lambda value: self.settings.set(option, value))
@@ -1125,6 +1161,8 @@ class Window(QMainWindow):
         return widget
 
     def apply(self):
+        self.refreshButton.setVisible(self.autoCheck.isChecked())
+        self.checkButton.setVisible(not self.autoCheck.isChecked())
         if hasattr(self, "updater"):
             proxy = self.proxy()
             if proxy != self.proxySelection:
