@@ -928,6 +928,8 @@ class Window(QMainWindow):
         if self.settings.get(Settings.Option.CHECK):
             QTimer.singleShot(0, self.check)
 
+        QTimer.singleShot(0, self.fit)
+
     def panel(self, checkButton):
         self.settingWidgets = {}
         platforms = [("Auto", "")] + [(label, value) for value, label in Platform.supported().items()]
@@ -1161,7 +1163,7 @@ class Window(QMainWindow):
     def event(self, event):
         handled = super().event(event)
         if event.type() == QEvent.LayoutRequest and hasattr(self, "settingsPanel"):
-            self.fit()
+            QTimer.singleShot(0, self.fit)
         return handled
 
     @staticmethod
