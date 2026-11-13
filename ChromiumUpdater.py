@@ -939,7 +939,7 @@ class Window(QMainWindow):
         ])
 
         self.autoCheck = autoCheck = QCheckBox("Check for updates on startup")
-        autoCheck.setToolTip("Check the selected target when the updater opens; no automatic download or installation")
+        autoCheck.setToolTip("Check when the updater opens or the platform changes; no automatic download or installation")
         self.installCheck = QCheckBox("Install Chromium")
         self.prepareCheck = QCheckBox("Prepare Chromium for macOS")
         self.prepareCheck.setToolTip(
@@ -1135,10 +1135,13 @@ class Window(QMainWindow):
         for label, value in items:
             combo.addItem(label, value)
         self.settingWidgets[option] = combo
-        combo.currentIndexChanged.connect(lambda: (
-            self.settings.set(option, combo.currentData()),
-            self.apply(),
-        ))
+        def selected():
+            self.settings.set(option, combo.currentData())
+            self.apply()
+            if option == Settings.Option.PLATFORM and self.autoCheck.isChecked() and hasattr(self, "updater"):
+                self.check()
+
+        combo.currentIndexChanged.connect(selected)
         return combo
 
     def fit(self):
