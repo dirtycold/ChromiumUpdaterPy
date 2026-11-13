@@ -308,7 +308,11 @@ class Updater(QObject):
             return
         self.report = self.snapshot(self.Stage.CHECKING, folder, file, 0)
         self.changed.emit()
-        reply = self.manager.get(self.request(f"{self.SERVER}/{folder}/LAST_CHANGE"))
+        request = self.request(f"{self.SERVER}/{folder}/LAST_CHANGE")
+        request.setAttribute(QNetworkRequest.Attribute.CacheLoadControlAttribute,
+                             QNetworkRequest.CacheLoadControl.AlwaysNetwork)
+        request.setRawHeader(b"Cache-Control", b"no-cache")
+        reply = self.manager.get(request)
 
         def finished():
             reply.deleteLater()
