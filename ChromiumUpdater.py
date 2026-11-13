@@ -5,6 +5,7 @@ import hashlib
 import os
 import plistlib
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -374,6 +375,14 @@ class Updater(QObject):
                 self.report = {**self.report, "error": f"Download failed: {message}"}
             self.finished.emit(self.Result.CANCELLED if self.cancelled else self.Result.FAILED)
 
+        def completed():
+            result = self.install(path, options) if install else self.Result.DONE
+            if result == self.Result.DONE:
+                warning = self.retain(path, options[Settings.Option.CLEANUP], install)
+                if warning:
+                    self.report = {**self.report, "error": f"Download retention incomplete: {warning}"}
+            self.finished.emit(result)
+
         def intact(name):
             """Whether name has the server's size and MD5."""
             if QFileInfo(name).size() != size:
@@ -490,7 +499,7 @@ class Updater(QObject):
                 else:
                     stopped = True
                     self.publish(received=size, total=size)
-                    self.finished.emit(self.install(path, options) if install else self.Result.DONE)
+                    completed()
 
         def describe():
             head = self.manager.head(self.request(url))
@@ -525,7 +534,7 @@ class Updater(QObject):
             elif intact(path):
                 stopped = True
                 self.publish(received=size, total=size)
-                self.finished.emit(self.install(path, options) if install else self.Result.DONE)
+                completed()
             elif not QDir().mkpath(path.rsplit("/", 1)[0]) or not part.open(
                     QIODevice.OpenModeFlag.ReadWrite | QIODevice.OpenModeFlag.Truncate) or not part.resize(size):
                 fail(part.errorString())
@@ -533,6 +542,31 @@ class Updater(QObject):
                 for _ in range(count):
                     fetch(len(ranges))
         describe()
+
+    @staticmethod
+    def retain(archive, keep, installed):
+        """Prune entire revision directories; keep the current output first."""
+        archive = Path(archive)
+        keep = max(0 if installed else 1, keep)
+        try:
+            root = archive.parent.parent
+            candidates = []
+            for directory in root.iterdir():
+                if not directory.name.isascii() or not directory.name.isdigit():
+                    continue
+                if directory.is_symlink() or not directory.is_dir():
+                    continue
+                candidate = directory / archive.name
+                if not candidate.is_symlink() and candidate.is_file():
+                    candidates.append(candidate)
+                else:
+                    shutil.rmtree(directory)
+            candidates.sort(key=lambda path: (path == archive, int(path.parent.name)), reverse=True)
+            for candidate in candidates[keep:]:
+                shutil.rmtree(candidate.parent)
+        except OSError as error:
+            return str(error)
+        return ""
 
     def extract(self, archive, destination):
         """Unpacks into the caller's staging directory."""
@@ -953,7 +987,7 @@ class Window(QMainWindow):
         segments = QSpinBox()
         segments.setToolTip("Parallel connections for one download")
         cleanup = QSpinBox()
-        cleanup.setToolTip("Recent revisions kept per platform; 0 removes the download after successful installation")
+        cleanup.setToolTip("Revisions kept per target after success; 0 keeps the latest download, or removes downloads after successful installation")
         for spin, option, low, high in (
                 (self.proxyPort, Settings.Option.PROXYPORT, 1, 65535),
                 (segments, Settings.Option.SEGMENTS, 1, 8),
@@ -1271,7 +1305,7 @@ class Window(QMainWindow):
 
     def options(self):
         options = {option: self.settings.get(option) for option in (
-            Settings.Option.DOWNLOADDIR, Settings.Option.SEGMENTS, Settings.Option.INSTALL,
+            Settings.Option.DOWNLOADDIR, Settings.Option.SEGMENTS, Settings.Option.CLEANUP, Settings.Option.INSTALL,
             Settings.Option.INSTALLDIR, Settings.Option.MACSIGN,
             Settings.Option.WINSYSTEM, Settings.Option.WINDESKTOP, Settings.Option.LINUXDESKTOP)}
         options[Settings.Option.INSTALL] = self.installable
@@ -1297,7 +1331,8 @@ class Window(QMainWindow):
             self.progress.setRange(0, 100)
             self.progress.setValue(100)
             done = "Installed" if report["stage"] == Updater.Stage.INSTALLING else "Downloaded"
-            self.status.setText(f"{done} revision {report['revision']}")
+            text = f"{done} revision {report['revision']}"
+            self.status.setText(f"{text} · {report['error']}" if report["error"] else text)
 
     def closeEvent(self, event):
         if self.active and not self.updater.report["cancellable"]:
