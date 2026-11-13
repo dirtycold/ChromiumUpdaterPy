@@ -14,16 +14,16 @@ import zipfile
 from enum           import  Enum
 from pathlib        import  Path
 
-from qtpy.QtCore    import (QDir, QElapsedTimer, QEvent, QFile, QFileInfo, 
+from qtpy.QtCore    import (QDir, QElapsedTimer, QEvent, QFile, QFileInfo,
                             QIODevice, QLockFile, QObject, QSaveFile, QSettings, QSignalBlocker, QStandardPaths, QStorageInfo,
                             QSysInfo, QThread, QTimer, QUrl, Qt, Signal, Slot,
                             )
 from qtpy.QtGui     import  QDesktopServices, QIcon
-from qtpy.QtNetwork import (QNetworkAccessManager, QNetworkProxy, 
+from qtpy.QtNetwork import (QNetworkAccessManager, QNetworkProxy,
                             QNetworkProxyFactory, QNetworkProxyQuery, QNetworkReply, QNetworkRequest,
                             )
-from qtpy.QtWidgets import (QApplication, QCheckBox, QComboBox, QFileDialog, 
-                            QFormLayout, QGroupBox, QHBoxLayout, QLabel, 
+from qtpy.QtWidgets import (QApplication, QCheckBox, QComboBox, QFileDialog,
+                            QFormLayout, QGroupBox, QHBoxLayout, QLabel,
                             QLayout, QLineEdit, QMainWindow, QProgressBar, QPushButton,
                             QSizePolicy, QSpinBox, QStyle, QToolBar, QToolButton, QVBoxLayout, QWidget,
                             )
@@ -941,13 +941,18 @@ class Window(QMainWindow):
         ])
 
         self.autoCheck = autoCheck = QCheckBox("Check for updates on startup")
-        autoCheck.setToolTip("Check when the updater opens or the platform changes; no automatic download or installation")
+        autoCheck.setToolTip(
+            "Check when the updater opens or the platform changes.\n"
+            "No automatic download or installation.")
         self.installCheck = QCheckBox("Install Chromium")
         self.prepareCheck = QCheckBox("Prepare Chromium for macOS")
         self.prepareCheck.setToolTip(
-            "Remove quarantine; repair only the outer app signature for the known resource error.")
+            "Remove quarantine.\n"
+            "Repair only the outer app signature for the known resource error.")
         self.systemCheck = QCheckBox("Install system-wide for Windows")
-        self.systemCheck.setToolTip("Windows EXE installer: --system-level; requires administrator approval")
+        self.systemCheck.setToolTip(
+            "Windows EXE installer: --system-level\n"
+            "Requires administrator approval.")
         self.desktopCheck = QCheckBox("Create desktop shortcut for Windows")
         self.desktopCheck.setToolTip("Windows ZIP installation only")
         desktopOption = Settings.Option.WINDESKTOP
@@ -986,14 +991,19 @@ class Window(QMainWindow):
         self.settingWidgets[Settings.Option.PROXYHOST] = self.proxyHost
         self.proxyHost.setMinimumWidth(240)
         self.proxyHost.setPlaceholderText("proxy.example.com")
-        self.proxyHost.setToolTip("Hostname only; authenticated proxies are not supported yet")
+        self.proxyHost.setToolTip(
+            "Hostname only.\n"
+            "Authenticated proxies are not supported yet.")
         self.proxyHost.editingFinished.connect(
             lambda: (self.settings.set(Settings.Option.PROXYHOST, self.proxyHost.text().strip()), self.apply()))
         self.proxyPort = QSpinBox()
         segments = QSpinBox()
         segments.setToolTip("Parallel connections for one download")
         cleanup = QSpinBox()
-        cleanup.setToolTip("Revisions kept per target after success; 0 keeps the latest download, or removes downloads after successful installation")
+        cleanup.setToolTip(
+            "Revisions kept per target after success.\n"
+            "0 keeps the latest download, or removes downloads\n"
+            "after successful installation.")
         for spin, option, low, high in (
                 (self.proxyPort, Settings.Option.PROXYPORT, 1, 65535),
                 (segments, Settings.Option.SEGMENTS, 1, 8),
@@ -1049,7 +1059,9 @@ class Window(QMainWindow):
         for box in (general, self.platformBox, proxy):
             layout.addWidget(box)
         resetButton = QPushButton("Reset settings…")
-        resetButton.setToolTip(f"Hold for {self.RESET} seconds to restore defaults. Downloaded files will be kept.")
+        resetButton.setToolTip(
+            f"Hold for {self.RESET} seconds to restore defaults.\n"
+            "Downloaded files will be kept.")
         resetButton.setFixedWidth(resetButton.sizeHint().width())
         clock = QElapsedTimer()
         timer = QTimer(resetButton)
