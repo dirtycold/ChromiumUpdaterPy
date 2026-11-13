@@ -23,8 +23,8 @@ from qtpy.QtNetwork import (QNetworkAccessManager, QNetworkProxy,
                             )
 from qtpy.QtWidgets import (QApplication, QCheckBox, QComboBox, QFileDialog, 
                             QFormLayout, QGroupBox, QHBoxLayout, QLabel, 
-                            QLayout, QLineEdit, QProgressBar, QPushButton, 
-                            QSizePolicy, QSpinBox, QStyle, QToolButton, QVBoxLayout, QWidget,
+                            QLayout, QLineEdit, QMainWindow, QProgressBar, QPushButton,
+                            QSizePolicy, QSpinBox, QStyle, QToolBar, QToolButton, QVBoxLayout, QWidget,
                             )
 
 
@@ -780,7 +780,21 @@ class Updater(QObject):
         if self.replies:
             self.replies[0].abort()
 
-class Window(QWidget):
+
+class ToolbarControls(QWidget):
+    def sizeHint(self):
+        size = super().sizeHint()
+        if self.layout() is not None:
+            size.setHeight(self.layout().totalHeightForWidth(self.width()))
+        return size
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if event.size().width() != event.oldSize().width():
+            self.updateGeometry()
+
+
+class Window(QMainWindow):
     # Seconds required to hold Reset settings
     RESET = 3
 
@@ -832,14 +846,26 @@ class Window(QWidget):
         actions.addStretch()
         actions.addWidget(settingsButton)
 
-        layout = QVBoxLayout(self)
+        controls = ToolbarControls()
+        controls.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        layout = QVBoxLayout(controls)
         layout.setSizeConstraint(QLayout.SetNoConstraint)
         layout.addLayout(status)
         layout.addWidget(self.progress)
         layout.addLayout(actions)
+        toolbar = QToolBar("Update controls", self)
+        toolbar.setObjectName("updateControls")
+        toolbar.setMovable(False)
+        toolbar.setFloatable(False)
+        toolbar.setAllowedAreas(Qt.TopToolBarArea)
+        toolbar.addWidget(controls)
+        self.addToolBar(Qt.TopToolBarArea, toolbar)
+        if sys.platform == "darwin":
+            self.setUnifiedTitleAndToolBarOnMac(True)
+
         self.settingsPanel = self.panel(self.checkButton)
+        self.setCentralWidget(self.settingsPanel)
         self.settingsPanel.hide()
-        layout.addWidget(self.settingsPanel)
         settingsButton.toggled.connect(lambda visible: self.settingsPanel.setVisible(visible))
         self.apply()
 
@@ -977,7 +1003,6 @@ class Window(QWidget):
 
         settingsPanel = QWidget()
         layout = QVBoxLayout(settingsPanel)
-        layout.setContentsMargins(0, 0, 0, 0)
         for box in (general, self.platformBox, proxy):
             layout.addWidget(box)
         resetButton = QPushButton("Reset settings…")
@@ -1009,9 +1034,11 @@ class Window(QWidget):
             return
         self.settings.setting.clear()
         previous = self.settingsPanel
+        visible = previous.isVisible()
         self.settingsPanel = self.panel(self.checkButton)
-        self.layout().replaceWidget(previous, self.settingsPanel)
-        self.settingsPanel.setVisible(previous.isVisible())
+        self.takeCentralWidget()
+        self.setCentralWidget(self.settingsPanel)
+        self.settingsPanel.setVisible(visible)
         previous.hide()
         previous.deleteLater()
         self.apply()
